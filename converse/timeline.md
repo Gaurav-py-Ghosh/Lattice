@@ -1,0 +1,9 @@
+- Project directory structure created and explained.
+- Placeholder Go files created.
+- Go module initialized with 'github.com/user/converse'.
+- Implemented a minimal runnable version with audio capture and VAD.
+- Resolved environment setup issues (MinGW, PKG_CONFIG_PATH, GOROOT).
+- Tuned VAD sensitivity and cleaned up logging for a smoother user experience.
+- Resolved `FileNotFoundError` race condition for temporary audio files.
+- Fixed missing `encoder.Close()` for valid WAV file generation.
+- **Major Simplification:** Refactored project to remove VAD and server logic, switching to a simple 10-second time-based transcription loop as per user request.
