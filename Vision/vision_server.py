@@ -37,8 +37,9 @@ active_sessions = {}
 
 
 class VisionSession:
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, headless: bool = True):
         self.session_id = session_id
+        self.headless = headless  # Default to headless (no windows)
         self.process: Optional[subprocess.Popen] = None
         self.log_file_path = Path(__file__).parent / "data" / f"gaze_log_{session_id}.txt"
         self.start_time = datetime.now()
@@ -57,19 +58,27 @@ class VisionSession:
         print(f"   Python: {python_exe}")
         print(f"   Script: {vision_script}")
         print(f"   Session ID: {self.session_id}")
+        print(f"   Headless Mode: {self.headless}")
+        
+        # Build command arguments
+        cmd = [python_exe, str(vision_script), "--session-id", self.session_id]
+        if self.headless:
+            cmd.append("--headless")
         
         # Start vision.py with session ID as argument
-        # CREATE_NEW_CONSOLE opens a new window for vision.py
+        # Run as background process without console window
         try:
             if os.name == 'nt':  # Windows
+                # CREATE_NO_WINDOW hides the console window completely
+                # If headless=True, OpenCV windows won't be created at all
                 self.process = subprocess.Popen(
-                    [python_exe, str(vision_script), "--session-id", self.session_id],
+                    cmd,
                     cwd=Path(__file__).parent,
-                    creationflags=subprocess.CREATE_NEW_CONSOLE
+                    creationflags=subprocess.CREATE_NO_WINDOW
                 )
             else:  # Linux/Mac
                 self.process = subprocess.Popen(
-                    [python_exe, str(vision_script), "--session-id", self.session_id],
+                    cmd,
                     cwd=Path(__file__).parent,
                 )
         except Exception as e:
@@ -149,7 +158,9 @@ async def websocket_endpoint(websocket: WebSocket):
             if action == 'start_session':
                 # Create new session
                 session_id = str(uuid.uuid4())
-                session = VisionSession(session_id)
+                # headless=True means no OpenCV windows, headless=False shows windows (minimized)
+                headless = message.get('headless', True)  # Default to headless
+                session = VisionSession(session_id, headless=headless)
                 session.start()
                 
                 active_sessions[session_id] = session

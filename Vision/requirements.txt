@@ -5,3 +5,5 @@ scipy
 pyautogui
 keyboard
 websockets
+pywin32  # For minimizing windows on Windows
+pywin32

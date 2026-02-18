@@ -11,11 +11,23 @@ import threading
 import datetime
 import keyboard
 import argparse
+import platform
+
+# Windows-specific imports for minimizing windows
+if platform.system() == 'Windows':
+    import ctypes
+    import ctypes.wintypes
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Vision Gaze Tracking')
 parser.add_argument('--session-id', type=str, default='default', help='Session ID for log file')
+parser.add_argument('--headless', action='store_true', help='Run without displaying OpenCV windows')
 args = parser.parse_args()
+
+# Headless mode flag
+HEADLESS_MODE = args.headless
+if HEADLESS_MODE:
+    print('🔇 Running in HEADLESS mode - OpenCV windows disabled')
 
 # Screen and mouse control setup (from old script)
 MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
@@ -85,6 +97,40 @@ face_mesh = mp_face_mesh.FaceMesh(
 cap = cv2.VideoCapture(0)
 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+# Create named windows that we can control (only if not headless)
+if not HEADLESS_MODE:
+    cv2.namedWindow("Integrated Eye Tracking", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("Head/Eye Debug", cv2.WINDOW_NORMAL)
+
+# Windows minimization function
+def minimize_cv2_windows():
+    """Minimize OpenCV windows on Windows OS"""
+    if platform.system() == 'Windows':
+        try:
+            import win32gui
+            import win32con
+            
+            # Wait a moment for windows to be created
+            time.sleep(0.5)
+            
+            def find_and_minimize_window(title):
+                hwnd = win32gui.FindWindow(None, title)
+                if hwnd:
+                    win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+                    print(f"✓ Minimized window: {title}")
+                    return True
+                return False
+            
+            # Try to minimize both windows
+            find_and_minimize_window("Integrated Eye Tracking")
+            find_and_minimize_window("Head/Eye Debug")
+            
+        except ImportError:
+            print("⚠️ pywin32 not available - windows will not be minimized")
+            print("   Install with: pip install pywin32")
+        except Exception as e:
+            print(f"⚠️ Could not minimize windows: {e}")
 
 # === Nose-only landmark indices (for stable up/down eye sphere tracking) ===
 # These landmarks are near the nose and are less affected by lateral head movement
@@ -751,7 +797,8 @@ def render_debug_view_orbit(
         cv2.putText(debug, text, (x0, y), font, font_scale, (200, 200, 200), thickness, cv2.LINE_AA)
 
 
-    cv2.imshow("Head/Eye Debug", debug)
+    if not HEADLESS_MODE:
+        cv2.imshow("Head/Eye Debug", debug)
 
 
 
@@ -776,6 +823,10 @@ right_sphere_locked = False
 right_sphere_local_offset = None
 right_calibration_nose_scale = None
 
+# Auto-calibration state
+auto_calibrated = False
+auto_calibration_start_time = time.time()  # Track when program started
+
 # Session-specific log file
 script_dir = os.path.dirname(__file__)
 data_dir = os.path.join(script_dir, "data")
@@ -783,6 +834,9 @@ os.makedirs(data_dir, exist_ok=True)
 log_file_path = os.path.join(data_dir, f"gaze_log_{args.session_id}.txt")
 log_file = open(log_file_path, "w")  # 'w' mode to create new file for each session
 print(f"Logging gaze data to: {log_file_path}")
+
+# Flag to track if windows have been minimized
+windows_minimized = False
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -1000,7 +1054,13 @@ while cap.isOpened():
     )
 
 
-    cv2.imshow("Integrated Eye Tracking", frame)
+    if not HEADLESS_MODE:
+        cv2.imshow("Integrated Eye Tracking", frame)
+
+        # Minimize windows after first frame is shown
+        if not windows_minimized:
+            minimize_cv2_windows()
+            windows_minimized = True
 
     # Handle keyboard input
     if keyboard.is_pressed('f7'):
@@ -1008,10 +1068,64 @@ while cap.isOpened():
         print(f"[Mouse Control] {'Enabled' if mouse_control_enabled else 'Disabled'}")
         time.sleep(0.3)  # debounce to prevent rapid toggling
 
+    # Auto-calibration after 3 seconds
+    if not auto_calibrated and not (left_sphere_locked and right_sphere_locked):
+        elapsed_time = time.time() - auto_calibration_start_time
+        if elapsed_time >= 3.0:  # Wait 3 seconds before auto-calibrating
+            current_nose_scale = compute_scale(nose_points_3d)
+            # Lock LEFT eye
+            left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)
+            camera_dir_world = np.array([0, 0, 1])
+            camera_dir_local = R_final.T @ camera_dir_world
+            left_sphere_local_offset += base_radius * camera_dir_local
+            left_calibration_nose_scale = current_nose_scale
+            left_sphere_locked = True
+
+            # Lock RIGHT eye
+            right_sphere_local_offset = R_final.T @ (iris_3d_right - head_center)
+            right_sphere_local_offset += base_radius * camera_dir_local
+            right_calibration_nose_scale = current_nose_scale
+            right_sphere_locked = True
+
+            # === Create 3D monitor plane at calibration ===
+            sphere_world_l_calib = head_center + R_final @ left_sphere_local_offset
+            sphere_world_r_calib = head_center + R_final @ right_sphere_local_offset
+
+            # Estimate a forward gaze direction from the two eyes
+            left_dir  = iris_3d_left  - sphere_world_l_calib
+            right_dir = iris_3d_right - sphere_world_r_calib
+            # Normalize (guard zero)
+            if np.linalg.norm(left_dir)  > 1e-9: left_dir  /= np.linalg.norm(left_dir)
+            if np.linalg.norm(right_dir) > 1e-9: right_dir /= np.linalg.norm(right_dir)
+            forward_hint = (left_dir + right_dir) * 0.5
+            if np.linalg.norm(forward_hint) > 1e-9:
+                forward_hint /= np.linalg.norm(forward_hint)
+            else:
+                forward_hint = None
+
+            gaze_origin = (sphere_world_l_calib + sphere_world_r_calib) / 2
+            gaze_dir = forward_hint
+
+            monitor_corners, monitor_center_w, monitor_normal_w, units_per_cm = create_monitor_plane(
+                head_center, R_final, face_landmarks, w, h,
+                forward_hint=forward_hint,
+                gaze_origin=gaze_origin,
+                gaze_dir=gaze_dir
+            )
+
+            # Freeze the debug world's orbit pivot at the calibrated monitor center
+            debug_world_frozen = True
+            orbit_pivot_frozen = monitor_center_w.copy()
+            print("[Auto-Calibration] Eye sphere calibration complete - gaze tracking started!")
+            print(f"[Monitor] units_per_cm={units_per_cm:.3f}, center={monitor_center_w}, normal={monitor_normal_w}")
+            
+            auto_calibrated = True
+
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
-    elif key == ord('c') and not (left_sphere_locked and right_sphere_locked):
+    elif key == ord('c'):
+        # Manual recalibration (can be done anytime)
         current_nose_scale = compute_scale(nose_points_3d)
         # Lock LEFT eye
         left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)
@@ -1023,12 +1137,11 @@ while cap.isOpened():
 
         # Lock RIGHT eye
         right_sphere_local_offset = R_final.T @ (iris_3d_right - head_center)
-        right_sphere_local_offset += base_radius * camera_dir_local  # use same camera_dir_local
+        right_sphere_local_offset += base_radius * camera_dir_local
         right_calibration_nose_scale = current_nose_scale
         right_sphere_locked = True
 
         # === Create 3D monitor plane at calibration ===
-        # Compute instantaneous sphere positions at calibration distance (scale=1)
         sphere_world_l_calib = head_center + R_final @ left_sphere_local_offset
         sphere_world_r_calib = head_center + R_final @ right_sphere_local_offset
 
@@ -1042,10 +1155,10 @@ while cap.isOpened():
         if np.linalg.norm(forward_hint) > 1e-9:
             forward_hint /= np.linalg.norm(forward_hint)
         else:
-            forward_hint = None  # fallback to head frame
+            forward_hint = None
 
         gaze_origin = (sphere_world_l_calib + sphere_world_r_calib) / 2
-        gaze_dir = forward_hint  # already normalized
+        gaze_dir = forward_hint
 
         monitor_corners, monitor_center_w, monitor_normal_w, units_per_cm = create_monitor_plane(
             head_center, R_final, face_landmarks, w, h,
@@ -1055,15 +1168,10 @@ while cap.isOpened():
         )
 
         # Freeze the debug world's orbit pivot at the calibrated monitor center
-        #global debug_world_frozen, orbit_pivot_frozen
         debug_world_frozen = True
         orbit_pivot_frozen = monitor_center_w.copy()
-        print("[Debug View] World pivot frozen at monitor center.")
-
+        print("[Manual Recalibration] Eye sphere calibration complete!")
         print(f"[Monitor] units_per_cm={units_per_cm:.3f}, center={monitor_center_w}, normal={monitor_normal_w}")
-
-
-        print("[Both Spheres Locked] Eye sphere calibration complete.")
     elif key == ord('s') and left_sphere_locked and right_sphere_locked:
         # Screen calibration - user should look at center of screen when pressing 's'
         # Get current gaze direction

@@ -13,3 +13,4 @@ numpy>=1.24.0
 scipy>=1.11.0
 pyautogui>=0.9.54
 keyboard>=0.13.5
+pywin32>=306  # For minimizing windows on Windows
