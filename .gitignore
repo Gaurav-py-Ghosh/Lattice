@@ -2,3 +2,15 @@ Atempt2/checkpoints/
 __pycache__/
 *.pyc
 Vision/data/
+
+# Audio
+*.wav
+*.mp4
+
+# Dataset
+*.csv
+data/
+audio/
+converted_*.wav
+*.safetensors
+*.pt
