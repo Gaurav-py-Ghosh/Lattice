@@ -10,6 +10,12 @@ import pyautogui
 import threading
 import datetime
 import keyboard
+import argparse
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='Vision Gaze Tracking')
+parser.add_argument('--session-id', type=str, default='default', help='Session ID for log file')
+args = parser.parse_args()
 
 # Screen and mouse control setup (from old script)
 MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
@@ -770,7 +776,13 @@ right_sphere_locked = False
 right_sphere_local_offset = None
 right_calibration_nose_scale = None
 
-log_file = open("gaze_log.txt", "a")
+# Session-specific log file
+script_dir = os.path.dirname(__file__)
+data_dir = os.path.join(script_dir, "data")
+os.makedirs(data_dir, exist_ok=True)
+log_file_path = os.path.join(data_dir, f"gaze_log_{args.session_id}.txt")
+log_file = open(log_file_path, "w")  # 'w' mode to create new file for each session
+print(f"Logging gaze data to: {log_file_path}")
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -894,6 +906,10 @@ while cap.isOpened():
                 f"Screen: ({screen_x}, {screen_y})",
                 f"Gaze: {gaze_status}"
             ]
+            
+            # Log the gaze status (before any override) to match what's displayed
+            log_file.write(f"{datetime.datetime.now().isoformat()}: {gaze_status}\n")
+            log_file.flush()
 
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.7
@@ -955,8 +971,9 @@ while cap.isOpened():
     if 'gaze_status' in locals() and eye_only_status != "Eyes Centered (Head Ref)":
         gaze_status = "Looking Away (Eyes Only)"
 
-    log_file.write(f"{datetime.datetime.now().isoformat()}: {gaze_status}\n")
-    log_file.flush()
+    # Don't log again here - already logged above with the screen-displayed value
+    # log_file.write(f"{datetime.datetime.now().isoformat()}: {gaze_status}\n")
+    # log_file.flush()
 
     # --- Add eye-only status to displayed text ---
     if 'texts' in locals():
@@ -1058,7 +1075,7 @@ while cap.isOpened():
         current_combined_direction /= np.linalg.norm(current_combined_direction)
         
         # Calculate what the raw angles would be without calibration
-        _, _, raw_yaw, raw_pitch = convert_gaze_to_screen_coordinates(
+        _, _, raw_yaw, raw_pitch, _ = convert_gaze_to_screen_coordinates(
             current_combined_direction, 0, 0  # no calibration offset
         )
         

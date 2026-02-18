@@ -1,2 +1,0 @@
-- **2026-02-08**:
-  - The `screen_position_file` path in `MonitorTracking.py` was updated to be relative to the script's directory, placing it inside a `data` subdirectory. This change aims to resolve `FileNotFoundError` issues by providing a more reliable and accessible file location, avoiding hardcoded absolute paths.

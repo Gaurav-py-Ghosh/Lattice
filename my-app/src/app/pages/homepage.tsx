@@ -1,10 +1,23 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 
 export default function HomePage() {
+  const router = useRouter();
   const [mousePosition, setMousePosition] = useState({ x: 0, y: 0 });
+  const [mlBars, setMlBars] = useState<Array<{ width: number; value: number }>>([]);
   const heroRef = useRef<HTMLDivElement>(null);
+
+  // Generate ML visualization bars on client side only (avoid hydration mismatch)
+  useEffect(() => {
+    setMlBars(
+      Array.from({ length: 12 }).map(() => ({
+        width: Math.random() * 40 + 60,
+        value: Math.random() * 0.3 + 0.7
+      }))
+    );
+  }, []);
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
@@ -105,8 +118,11 @@ export default function HomePage() {
           <button className="text-sm text-gray-400 hover:text-white transition-colors">
             Log in
           </button>
-          <button className="px-4 py-2 bg-white text-black text-sm font-medium rounded-lg hover:bg-gray-100 transition-all">
-            Get started
+          <button 
+            onClick={() => router.push('/interview')}
+            className="px-4 py-2 bg-white text-black text-sm font-medium rounded-lg hover:bg-gray-100 transition-all"
+          >
+            Start Interview
           </button>
         </div>
       </nav>
@@ -136,8 +152,11 @@ export default function HomePage() {
           </p>
 
           <div className="flex flex-wrap gap-4 animate-fade-in-up" style={{ animationDelay: '0.3s' }}>
-            <button className="px-6 py-3 bg-white text-black font-medium rounded-lg hover:bg-gray-100 transition-all hover:scale-105">
-              Get started for free
+            <button 
+              onClick={() => router.push('/interview')}
+              className="px-6 py-3 bg-white text-black font-medium rounded-lg hover:bg-gray-100 transition-all hover:scale-105"
+            >
+              Start Interview Now
             </button>
             <button className="px-6 py-3 bg-transparent border border-gray-700 text-white font-medium rounded-lg hover:border-gray-500 transition-all">
               Request a demo
@@ -300,7 +319,7 @@ export default function HomePage() {
           <div className="relative h-[500px]">
             <div className="absolute inset-0 bg-gradient-to-br from-purple-500/20 to-pink-500/20 rounded-2xl backdrop-blur-sm border border-white/10 p-8 overflow-hidden">
               <div className="space-y-3">
-                {Array.from({ length: 12 }).map((_, i) => (
+                {mlBars.map((bar, i) => (
                   <div 
                     key={i}
                     className="flex items-center gap-4 animate-slide-in"
@@ -311,9 +330,9 @@ export default function HomePage() {
                   >
                     <div className="w-2 h-2 bg-purple-400 rounded-full" />
                     <div className="flex-1 h-8 bg-gradient-to-r from-purple-500/40 to-transparent rounded" 
-                         style={{ width: `${Math.random() * 40 + 60}%` }} 
+                         style={{ width: `${bar.width}%` }} 
                     />
-                    <div className="text-xs text-gray-500 font-mono">{(Math.random() * 0.3 + 0.7).toFixed(2)}</div>
+                    <div className="text-xs text-gray-500 font-mono">{bar.value.toFixed(2)}</div>
                   </div>
                 ))}
               </div>
@@ -339,8 +358,11 @@ export default function HomePage() {
               Join thousands of organizations using AI-powered behavioral analysis to make better hiring decisions.
             </p>
             <div className="flex flex-wrap gap-4 justify-center">
-              <button className="px-8 py-4 bg-white text-black font-medium rounded-lg hover:bg-gray-100 transition-all hover:scale-105 text-lg">
-                Start free trial
+              <button 
+                onClick={() => router.push('/interview')}
+                className="px-8 py-4 bg-white text-black font-medium rounded-lg hover:bg-gray-100 transition-all hover:scale-105 text-lg"
+              >
+                Try Interview AI
               </button>
               <button className="px-8 py-4 bg-transparent border-2 border-white text-white font-medium rounded-lg hover:bg-white hover:text-black transition-all text-lg">
                 Book a demo
