@@ -9,6 +9,7 @@ export default function InterviewRoom() {
   const router = useRouter();
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [recordingTime, setRecordingTime] = useState(0);
@@ -17,12 +18,16 @@ export default function InterviewRoom() {
   const [interviewStarted, setInterviewStarted] = useState(false);
   const [visionSessionData, setVisionSessionData] = useState<any>(null);
   const [showResults, setShowResults] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   // Vision.py session hook
   const {
     isConnected: visionConnected,
     isSessionActive: visionActive,
     sessionData,
+    predictions,
+    predictionSummary,
+    latestConfidence,
     startSession: startVisionSession,
     stopSession: stopVisionSession,
     error: visionError,
@@ -85,14 +90,51 @@ export default function InterviewRoom() {
     }
   }, [sessionData, visionActive]);
 
+  // Handle fullscreen changes
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFullscreenChange);
+    };
+  }, []);
+
+  const enterFullscreen = async () => {
+    if (containerRef.current && !document.fullscreenElement) {
+      try {
+        await containerRef.current.requestFullscreen();
+        console.log('✅ Entered fullscreen mode');
+      } catch (err) {
+        console.error('❌ Error entering fullscreen:', err);
+      }
+    }
+  };
+
+  const exitFullscreen = async () => {
+    if (document.fullscreenElement) {
+      try {
+        await document.exitFullscreen();
+        console.log('✅ Exited fullscreen mode');
+      } catch (err) {
+        console.error('❌ Error exiting fullscreen:', err);
+      }
+    }
+  };
+
   const handleCalibrationComplete = () => {
     setShowCalibration(false);
     setInterviewStarted(true);
     
+    // Enter fullscreen mode
+    enterFullscreen();
+    
     // Start vision.py session when interview starts
     if (visionConnected && !visionActive) {
-      console.log('🎥 Starting vision.py session...');
-      startVisionSession();
+      console.log('🎥 Starting vision.py session in headless mode (no windows)...');
+      startVisionSession(true); // headless=true: no OpenCV windows
     }
   };
 
@@ -104,6 +146,9 @@ export default function InterviewRoom() {
 
   const handleLeave = async () => {
     if (confirm('Leave the interview? Your progress will be saved.')) {
+      // Exit fullscreen first
+      await exitFullscreen();
+      
       // Stop vision session and wait for results
       if (visionActive) {
         console.log('⏹️ Stopping vision.py session...');
@@ -118,7 +163,7 @@ export default function InterviewRoom() {
   };
 
   return (
-    <div className="min-h-screen bg-[#0a0a0f] text-white flex flex-col">
+    <div ref={containerRef} className="min-h-screen bg-[#0a0a0f] text-white flex flex-col">
       {/* Calibration Flow */}
       {showCalibration && (
         <CalibrationFlow
@@ -152,6 +197,30 @@ export default function InterviewRoom() {
         </div>
 
         <div className="flex items-center gap-4">
+          {/* Fullscreen Toggle */}
+          {isFullscreen ? (
+            <button
+              onClick={exitFullscreen}
+              className="px-3 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 text-sm font-medium rounded-lg transition-all border border-blue-500/30 flex items-center gap-2"
+              title="Exit Fullscreen"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+              Exit Fullscreen
+            </button>
+          ) : interviewStarted && (
+            <button
+              onClick={enterFullscreen}
+              className="px-3 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 text-sm font-medium rounded-lg transition-all border border-blue-500/30 flex items-center gap-2"
+              title="Enter Fullscreen"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+              </svg>
+              Fullscreen
+            </button>
+          )}
           {/* Vision Server Status */}
           {visionError && (
             <div className="px-3 py-1.5 bg-red-500/20 border border-red-500/30 rounded-lg text-xs text-red-400">
@@ -167,7 +236,7 @@ export default function InterviewRoom() {
           {/* Manual Vision Control */}
           {!visionActive && visionConnected && interviewStarted && (
             <button
-              onClick={startVisionSession}
+              onClick={() => startVisionSession(true)} // headless=true
               className="px-3 py-1.5 bg-green-500/20 hover:bg-green-500/30 text-green-400 text-sm font-medium rounded-lg transition-all border border-green-500/30"
             >
               Start Gaze Track
@@ -313,12 +382,32 @@ export default function InterviewRoom() {
               {/* Confidence Score */}
               <div className="p-4 rounded-lg bg-blue-500/10 border border-white/10">
                 <div className="flex justify-between items-center mb-2">
-                  <span className="text-sm text-gray-300">Overall Confidence</span>
-                  <span className="text-sm font-bold text-blue-400">87%</span>
+                  <span className="text-sm text-gray-300">AI Confidence Score</span>
+                  <span className="text-sm font-bold text-blue-400">
+                    {latestConfidence !== null 
+                      ? `${(latestConfidence * 100).toFixed(1)}%`
+                      : predictions.length > 0
+                      ? `${(predictionSummary?.mean_confidence ?? 0 * 100).toFixed(1)}%`
+                      : 'Analyzing...'}
+                  </span>
                 </div>
                 <div className="h-2 bg-black/30 rounded-full overflow-hidden">
-                  <div className="h-full bg-gradient-to-r from-blue-500 to-cyan-400 w-[87%]" />
+                  <div 
+                    className="h-full bg-gradient-to-r from-blue-500 to-cyan-400 transition-all duration-500"
+                    style={{ 
+                      width: latestConfidence !== null 
+                        ? `${Math.max(0, Math.min(100, latestConfidence * 100))}%`
+                        : predictions.length > 0
+                        ? `${Math.max(0, Math.min(100, (predictionSummary?.mean_confidence ?? 0) * 100))}%`
+                        : '0%'
+                    }}
+                  />
                 </div>
+                {predictions.length > 0 && (
+                  <div className="mt-2 text-xs text-gray-500">
+                    Based on {predictions.length} chunk{predictions.length !== 1 ? 's' : ''} analyzed
+                  </div>
+                )}
               </div>
 
               {/* Speaking Pace */}
@@ -350,11 +439,15 @@ export default function InterviewRoom() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
                   <div>
-                    <p className="text-sm font-medium text-yellow-400 mb-1">Tip</p>
+                    <p className="text-sm font-medium text-yellow-400 mb-1">
+                      {predictions.length > 0 ? 'AI Analysis Active' : 'Tip'}
+                    </p>
                     <p className="text-sm text-gray-400">
-                      {visionActive 
-                        ? 'Maintain eye contact with the camera. Check the Vision.py window for real-time feedback!'
-                        : 'Start your interview to begin gaze tracking analysis.'}
+                      {predictions.length > 0
+                        ? `VideoMAE is analyzing your interview in real-time. ${predictions.length} chunk${predictions.length !== 1 ? 's' : ''} processed so far.`
+                        : visionActive 
+                        ? 'Maintain eye contact with the camera. AI analysis will begin after 15 seconds.'
+                        : 'Start your interview to begin gaze tracking and AI analysis.'}
                     </p>
                   </div>
                 </div>

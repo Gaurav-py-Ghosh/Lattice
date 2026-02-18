@@ -13,11 +13,13 @@ import { useVisionSession } from '../hooks/useVisionSession';
 interface VisionSessionControlProps {
   onSessionEnd?: (logData: any) => void;
   autoStart?: boolean;
+  headless?: boolean;  // true = no windows (default), false = show minimized windows
 }
 
 export default function VisionSessionControl({ 
   onSessionEnd, 
-  autoStart = false 
+  autoStart = false,
+  headless = true  // Default to headless mode (no OpenCV windows)
 }: VisionSessionControlProps) {
   const {
     isConnected,
@@ -45,13 +47,13 @@ export default function VisionSessionControl({
   // Auto-start if enabled
   useEffect(() => {
     if (autoStart && isConnected && !isSessionActive) {
-      startSession();
+      startSession(headless);
     }
-  }, [autoStart, isConnected, isSessionActive, startSession]);
+  }, [autoStart, isConnected, isSessionActive, startSession, headless]);
 
   const handleStartSession = () => {
     setShowResults(false);
-    startSession();
+    startSession(headless);
   };
 
   const handleStopSession = () => {

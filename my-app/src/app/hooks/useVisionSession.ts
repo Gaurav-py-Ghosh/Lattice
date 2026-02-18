@@ -12,9 +12,26 @@ interface GazeLogEntry {
   status: string;
 }
 
+interface PredictionEntry {
+  chunk: number;
+  video_file: string;
+  confidence: number;
+  timestamp: number;
+  processing_time: number;
+}
+
+interface PredictionSummary {
+  count: number;
+  mean_confidence: number;
+  min_confidence: number;
+  max_confidence: number;
+}
+
 interface SessionData {
   session_id: string;
   log_data: GazeLogEntry[];
+  predictions: PredictionEntry[];
+  summary: PredictionSummary;
   start_time: string;
   end_time: string;
 }
@@ -30,6 +47,11 @@ export function useVisionSession() {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [sessionData, setSessionData] = useState<SessionData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  
+  // Real-time prediction state
+  const [predictions, setPredictions] = useState<PredictionEntry[]>([]);
+  const [predictionSummary, setPredictionSummary] = useState<PredictionSummary | null>(null);
+  const [latestConfidence, setLatestConfidence] = useState<number | null>(null);
   
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined);
@@ -53,12 +75,29 @@ export function useVisionSession() {
             setCurrentSessionId(message.session_id);
             setIsSessionActive(true);
             setSessionData(null);
+            setPredictions([]);
+            setPredictionSummary(null);
+            setLatestConfidence(null);
+            break;
+            
+          case 'prediction_update':
+            console.log('📊 New prediction:', message.prediction);
+            setPredictions(prev => [...prev, message.prediction]);
+            setLatestConfidence(message.prediction.confidence);
+            break;
+            
+          case 'prediction_summary':
+            console.log('📈 Prediction summary:', message.summary);
+            setPredictionSummary(message.summary);
             break;
             
           case 'session_ended':
             console.log('✓ Session ended:', message.session_id);
             console.log('  Log entries:', message.log_data.length);
+            console.log('  Predictions:', message.predictions?.length || 0);
             setSessionData(message);
+            setPredictions(message.predictions || []);
+            setPredictionSummary(message.summary || null);
             setIsSessionActive(false);
             setCurrentSessionId(null);
             break;
@@ -111,13 +150,16 @@ export function useVisionSession() {
     }
   }, []);
 
-  const startSession = useCallback(() => {
+  const startSession = useCallback((headless: boolean = true) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       setError('Not connected to server');
       return;
     }
     
-    wsRef.current.send(JSON.stringify({ action: 'start_session' }));
+    wsRef.current.send(JSON.stringify({ 
+      action: 'start_session',
+      headless: headless // true = no windows, false = minimized windows
+    }));
   }, []);
 
   const stopSession = useCallback(() => {
@@ -155,6 +197,11 @@ export function useVisionSession() {
     isSessionActive,
     currentSessionId,
     sessionData,
+    
+    // Real-time prediction state
+    predictions,
+    predictionSummary,
+    latestConfidence,
     
     // Actions
     startSession,

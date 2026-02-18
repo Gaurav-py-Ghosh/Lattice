@@ -12,6 +12,9 @@ import datetime
 import keyboard
 import argparse
 import platform
+import sounddevice as sd
+import soundfile as sf
+import queue
 
 # Windows-specific imports for minimizing windows
 if platform.system() == 'Windows':
@@ -27,7 +30,7 @@ args = parser.parse_args()
 # Headless mode flag
 HEADLESS_MODE = args.headless
 if HEADLESS_MODE:
-    print('🔇 Running in HEADLESS mode - OpenCV windows disabled')
+    print('[HEADLESS] Running in HEADLESS mode - OpenCV windows disabled')
 
 # Screen and mouse control setup (from old script)
 MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
@@ -118,7 +121,7 @@ def minimize_cv2_windows():
                 hwnd = win32gui.FindWindow(None, title)
                 if hwnd:
                     win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
-                    print(f"✓ Minimized window: {title}")
+                    print(f"Minimized window: {title}")
                     return True
                 return False
             
@@ -127,10 +130,10 @@ def minimize_cv2_windows():
             find_and_minimize_window("Head/Eye Debug")
             
         except ImportError:
-            print("⚠️ pywin32 not available - windows will not be minimized")
+            print("WARNING: pywin32 not available - windows will not be minimized")
             print("   Install with: pip install pywin32")
         except Exception as e:
-            print(f"⚠️ Could not minimize windows: {e}")
+            print(f"WARNING: Could not minimize windows: {e}")
 
 # === Nose-only landmark indices (for stable up/down eye sphere tracking) ===
 # These landmarks are near the nose and are less affected by lateral head movement
@@ -833,15 +836,128 @@ data_dir = os.path.join(script_dir, "data")
 os.makedirs(data_dir, exist_ok=True)
 log_file_path = os.path.join(data_dir, f"gaze_log_{args.session_id}.txt")
 log_file = open(log_file_path, "w")  # 'w' mode to create new file for each session
-print(f"Logging gaze data to: {log_file_path}")
+print(f"=" * 60, flush=True)
+print(f"Vision.py Starting - Session: {args.session_id}", flush=True)
+print(f"Logging gaze data to: {log_file_path}", flush=True)
+print(f"Headless mode: {HEADLESS_MODE}", flush=True)
+print(f"=" * 60, flush=True)
+
+# === Recording Configuration ===
+RECORDING_INTERVAL = 15  # seconds per chunk
+AUDIO_SAMPLE_RATE = 44100  # 44.1kHz
+AUDIO_CHANNELS = 2  # Stereo
+
+# Recording state
+recording_enabled = True
+audio_recording_enabled = False  # Audio is optional
+current_chunk = 0
+chunk_start_time = time.time()
+audio_queue = queue.Queue()
+video_writer = None
+audio_buffer = []
+audio_stream = None
+
+def get_chunk_filename(chunk_num, extension):
+    """Generate filename for recording chunk"""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(data_dir, f"{args.session_id}_chunk{chunk_num:03d}_{timestamp}.{extension}")
+
+def audio_callback(indata, frames, time_info, status):
+    """Callback for audio recording - runs in separate thread"""
+    if status:
+        print(f"Audio callback status: {status}")
+    audio_queue.put(indata.copy())
+
+def save_audio_chunk(audio_data, chunk_num):
+    """Save accumulated audio data to file"""
+    if len(audio_data) == 0:
+        return
+    
+    audio_array = np.concatenate(audio_data, axis=0)
+    filename = get_chunk_filename(chunk_num, "wav")
+    
+    try:
+        sf.write(filename, audio_array, AUDIO_SAMPLE_RATE)
+        print(f"💾 Saved audio chunk: {filename} ({len(audio_array)/AUDIO_SAMPLE_RATE:.1f}s)")
+    except Exception as e:
+        print(f"❌ Error saving audio: {e}")
+
+def start_new_video_chunk(chunk_num, frame_width, frame_height, fps):
+    """Create new video writer for chunk"""
+    filename = get_chunk_filename(chunk_num, "mp4")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(filename, fourcc, fps, (frame_width, frame_height))
+    
+    if not writer.isOpened():
+        print(f"ERROR: Could not open video writer for {filename}", flush=True)
+        return None
+    
+    print(f"Started video chunk: {filename}", flush=True)
+    return writer
+
+# Start audio recording stream (optional - won't disable video if this fails)
+if recording_enabled:
+    try:
+        audio_stream = sd.InputStream(
+            samplerate=AUDIO_SAMPLE_RATE,
+            channels=AUDIO_CHANNELS,
+            callback=audio_callback
+        )
+        audio_stream.start()
+        audio_recording_enabled = True
+        print(f"Audio recording started (Session: {args.session_id})", flush=True)
+        print(f"Recording chunks every {RECORDING_INTERVAL} seconds", flush=True)
+    except Exception as e:
+        print(f"WARNING: Audio recording disabled - {e}", flush=True)
+        print(f"Video-only recording will continue every {RECORDING_INTERVAL} seconds", flush=True)
+        audio_recording_enabled = False
+        # Keep recording_enabled = True for video
 
 # Flag to track if windows have been minimized
 windows_minimized = False
+
+# Initialize video recording
+fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+if recording_enabled:
+    video_writer = start_new_video_chunk(current_chunk, w, h, fps)
 
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
+
+    # === Recording Management ===
+    if recording_enabled:
+        current_time = time.time()
+        elapsed = current_time - chunk_start_time
+        
+        # Write current frame to video
+        if video_writer is not None:
+            video_writer.write(frame)
+        
+        # Collect audio from queue (only if audio is enabled)
+        if audio_recording_enabled:
+            while not audio_queue.empty():
+                audio_buffer.append(audio_queue.get())
+        
+        # Check if it's time to save chunk and start new one
+        if elapsed >= RECORDING_INTERVAL:
+            print(f"\nChunk {current_chunk} complete ({elapsed:.1f}s)", flush=True)
+            
+            # Save and close current video
+            if video_writer is not None:
+                video_writer.release()
+                print(f"Saved video chunk {current_chunk}", flush=True)
+            
+            # Save audio (only if audio recording is enabled)
+            if audio_recording_enabled:
+                save_audio_chunk(audio_buffer, current_chunk)
+            
+            # Start new chunk
+            current_chunk += 1
+            chunk_start_time = current_time
+            audio_buffer = []
+            video_writer = start_new_video_chunk(current_chunk, w, h, fps)
 
     combined_dir = None  # will be filled once you compute a smoothed direction
 
@@ -1250,6 +1366,38 @@ while cap.isOpened():
         else:
             print("[Marker] Monitor/gaze not ready; complete center calibration first.")
 
+
+# === Cleanup Recording ===
+if recording_enabled:
+    print("\n🛑 Stopping recording...")
+    
+    # Save final video chunk if there's data
+    if video_writer is not None:
+        video_writer.release()
+        print(f"💾 Saved final video chunk {current_chunk}")
+    
+    # Save remaining audio (only if audio recording is enabled)
+    if audio_recording_enabled:
+        while not audio_queue.empty():
+            audio_buffer.append(audio_queue.get())
+        save_audio_chunk(audio_buffer, current_chunk)
+    
+    # Stop audio stream (only if it was started)
+    if audio_stream is not None:
+        try:
+            audio_stream.stop()
+            audio_stream.close()
+            print("🎤 Audio recording stopped")
+        except:
+            pass
+    
+    # Create stop signal for inference process
+    stop_signal_path = os.path.join(data_dir, f"{args.session_id}_stop.signal")
+    with open(stop_signal_path, 'w') as f:
+        f.write(str(time.time()))
+    print(f"🚦 Created stop signal: {stop_signal_path}")
+    
+    print(f"✅ Recording complete: {current_chunk + 1} chunks saved")
 
 cap.release()
 

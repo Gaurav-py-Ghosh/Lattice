@@ -189,8 +189,19 @@ export default function CalibrationFlow({
               </h2>
               
               <p className="text-lg text-gray-300">
-                Eye tracking is calibrated and ready. You can now start your interview.
+                Eye tracking is calibrated and ready. Clicking "Start Interview" will enter fullscreen mode for an immersive experience.
               </p>
+
+              <div className="bg-blue-500/10 border border-blue-500/20 rounded-xl p-4 mb-2">
+                <div className="flex items-start gap-3">
+                  <svg className="w-5 h-5 text-blue-400 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <p className="text-sm text-blue-300">
+                    The interview will automatically enter fullscreen mode. Press ESC or click "Exit Fullscreen" to exit at any time.
+                  </p>
+                </div>
+              </div>
 
               <div className="bg-green-500/10 border border-green-500/20 rounded-xl p-4">
                 <div className="flex items-center justify-between">
@@ -224,9 +235,12 @@ export default function CalibrationFlow({
                 </button>
                 <button
                   onClick={handleStartInterview}
-                  className="flex-1 py-4 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white font-semibold rounded-xl transition-all shadow-lg hover:shadow-xl"
+                  className="flex-1 py-4 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white font-semibold rounded-xl transition-all shadow-lg hover:shadow-xl flex items-center justify-center gap-2"
                 >
-                  Start Interview
+                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                  </svg>
+                  Start Interview (Fullscreen)
                 </button>
               </div>
             </div>
