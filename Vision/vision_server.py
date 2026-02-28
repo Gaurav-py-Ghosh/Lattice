@@ -38,9 +38,15 @@ active_sessions = {}
 
 
 class VisionSession:
-    def __init__(self, session_id: str, headless: bool = True):
+    def __init__(self, session_id: str, headless: bool = True,
+                 video_path: Optional[str] = None,
+                 loop: bool = False,
+                 speed: float = 1.0):
         self.session_id = session_id
         self.headless = headless  # Default to headless (no windows)
+        self.video_path = video_path  # Path to video file; None = live webcam
+        self.loop = loop
+        self.speed = speed
         self.vision_process: Optional[subprocess.Popen] = None
         self.inference_process: Optional[subprocess.Popen] = None
         self.log_file_path = Path(__file__).parent / "data" / f"gaze_log_{session_id}.txt"
@@ -73,6 +79,18 @@ class VisionSession:
         vision_cmd = [python_exe, str(vision_script), "--session-id", self.session_id]
         if self.headless:
             vision_cmd.append("--headless")
+        if self.video_path:
+            if not os.path.exists(self.video_path):
+                print(f"ERROR: Video file not found: {self.video_path}")
+                self.is_running = False
+                return
+            vision_cmd.extend(["--video", self.video_path])
+            if self.loop:
+                vision_cmd.append("--loop")
+            if self.speed != 1.0:
+                vision_cmd.extend(["--speed", str(self.speed)])
+            print(f"   Video file: {self.video_path}")
+            print(f"   Loop: {self.loop} | Speed: {self.speed}x")
         
         # Build command arguments for inference.py
         inference_cmd = [
@@ -281,7 +299,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 session_id = str(uuid.uuid4())
                 # headless=True means no OpenCV windows, headless=False shows windows (minimized)
                 headless = message.get('headless', True)  # Default to headless
-                session = VisionSession(session_id, headless=headless)
+                video_path = message.get('video_path', None)
+                loop = message.get('loop', False)
+                speed = float(message.get('speed', 1.0))
+                session = VisionSession(session_id, headless=headless,
+                                        video_path=video_path, loop=loop, speed=speed)
                 session.start()
                 
                 active_sessions[session_id] = session

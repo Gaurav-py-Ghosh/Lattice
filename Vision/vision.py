@@ -25,6 +25,12 @@ if platform.system() == 'Windows':
 parser = argparse.ArgumentParser(description='Vision Gaze Tracking')
 parser.add_argument('--session-id', type=str, default='default', help='Session ID for log file')
 parser.add_argument('--headless', action='store_true', help='Run without displaying OpenCV windows')
+parser.add_argument('--video', type=str, default=None,
+                    help='Path to input video file (if omitted, webcam is used)')
+parser.add_argument('--loop', action='store_true',
+                    help='Loop video when it ends')
+parser.add_argument('--speed', type=float, default=1.0,
+                    help='Playback speed multiplier (0.5 = slow, 2.0 = fast)')
 args = parser.parse_args()
 
 # Headless mode flag
@@ -96,8 +102,15 @@ face_mesh = mp_face_mesh.FaceMesh(
     min_tracking_confidence=0.5
 )
 
-# === Open webcam ===
-cap = cv2.VideoCapture(0)
+# === Open video source (webcam or file) ===
+if args.video:
+    if not os.path.exists(args.video):
+        raise FileNotFoundError(f"Video file not found: {args.video}")
+    cap = cv2.VideoCapture(args.video)
+    print(f"[Video Mode] Using file: {args.video}", flush=True)
+else:
+    cap = cv2.VideoCapture(0)
+    print("[Camera Mode] Using live webcam", flush=True)
 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -828,7 +841,7 @@ right_calibration_nose_scale = None
 
 # Auto-calibration state
 auto_calibrated = False
-auto_calibration_start_time = time.time()  # Track when program started
+auto_calibration_start_time = 0.0  # Virtual clock; counts from first frame
 
 # Session-specific log file
 script_dir = os.path.dirname(__file__)
@@ -851,7 +864,7 @@ AUDIO_CHANNELS = 2  # Stereo
 recording_enabled = True
 audio_recording_enabled = False  # Audio is optional
 current_chunk = 0
-chunk_start_time = time.time()
+chunk_start_time = 0.0  # Virtual clock; counts from first frame
 audio_queue = queue.Queue()
 video_writer = None
 audio_buffer = []
@@ -895,8 +908,13 @@ def start_new_video_chunk(chunk_num, frame_width, frame_height, fps):
     print(f"Started video chunk: {filename}", flush=True)
     return writer
 
+# Disable audio capture when processing a video file (no live mic needed)
+if args.video:
+    audio_recording_enabled = False
+    recording_enabled = True   # video-only recording still OK
+
 # Start audio recording stream (optional - won't disable video if this fails)
-if recording_enabled:
+if recording_enabled and not args.video:
     try:
         audio_stream = sd.InputStream(
             samplerate=AUDIO_SAMPLE_RATE,
@@ -917,23 +935,42 @@ if recording_enabled:
 windows_minimized = False
 
 # Initialize video recording
-fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+fps = cap.get(cv2.CAP_PROP_FPS)
+if fps is None or fps <= 1:
+    fps = 30.0
+fps = float(fps)
+frame_dt = 1.0 / fps
 if recording_enabled:
     video_writer = start_new_video_chunk(current_chunk, w, h, fps)
 
+# Virtual clock: advances by frame_dt * speed per frame (deterministic for video files)
+virtual_time = 0.0
+
 while cap.isOpened():
     ret, frame = cap.read()
+
     if not ret:
-        break
+        if args.video and args.loop:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            virtual_time = 0.0
+            print("[Video] Looping video", flush=True)
+            continue
+        else:
+            print("[Video] End of file reached" if args.video else "[Camera] Stream ended", flush=True)
+            break
+
+    # Advance virtual clock each frame (deterministic; replaces time.time() in timing logic)
+    virtual_time += frame_dt * args.speed
 
     # === Recording Management ===
     if recording_enabled:
-        current_time = time.time()
+        current_time = virtual_time
         elapsed = current_time - chunk_start_time
         
-        # Write current frame to video
+        # Write current frame to video (frame.copy() avoids buffer-reuse issues
+        # when the source is a file-backed decoder)
         if video_writer is not None:
-            video_writer.write(frame)
+            video_writer.write(frame.copy())
         
         # Collect audio from queue (only if audio is enabled)
         if audio_recording_enabled:
@@ -1186,8 +1223,8 @@ while cap.isOpened():
 
     # Auto-calibration after 3 seconds
     if not auto_calibrated and not (left_sphere_locked and right_sphere_locked):
-        elapsed_time = time.time() - auto_calibration_start_time
-        if elapsed_time >= 3.0:  # Wait 3 seconds before auto-calibrating
+        elapsed_time = virtual_time - auto_calibration_start_time
+        if elapsed_time >= 3.0:  # Wait 3 seconds (virtual) before auto-calibrating
             current_nose_scale = compute_scale(nose_points_3d)
             # Lock LEFT eye
             left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)
