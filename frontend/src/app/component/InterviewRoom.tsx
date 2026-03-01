@@ -6,6 +6,22 @@ import { useVisionSession } from '../hooks/useVisionSession';
 import { useChunkedRecorder } from '../hooks/useChunkedRecorder';
 import CalibrationFlow from './CalibrationFlow';
 
+// ---------------------------------------------------------------------------
+// Static question bank — at module scope to avoid re-allocation on every render
+// ---------------------------------------------------------------------------
+const INTERVIEW_QUESTIONS = [
+  'Tell me about yourself and your background.',
+  'Describe a time when you had to work under pressure. How did you handle it?',
+  'What is your greatest professional achievement?',
+  'Tell me about a challenge you faced at work and how you overcame it.',
+  'Where do you see yourself in five years?',
+  'Why are you interested in this role?',
+  'Describe a situation where you had to work with a difficult team member.',
+  'What are your greatest strengths and how have they helped you professionally?',
+  'Tell me about a time you failed and what you learned from it.',
+  'Do you have any questions for us?',
+];
+
 export default function InterviewRoom() {
   const router = useRouter();
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -20,6 +36,9 @@ export default function InterviewRoom() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [permissionStatus, setPermissionStatus] = useState<'pending' | 'granted' | 'denied'>('pending');
 
+  const [questionIndex, setQuestionIndex] = useState(0);
+  const questionTimerRef = useRef<NodeJS.Timeout | null>(null);
+
   // Vision.py session hook
   const {
     isConnected: visionConnected,
@@ -27,7 +46,10 @@ export default function InterviewRoom() {
     latestConfidence,
     chunkResults,
     latestVoiceScore,
+    latestFacialScore,
     pendingChunks,
+    chunkErrors,
+    dismissChunkError,
     processChunk,
     error: visionError,
   } = useVisionSession();
@@ -127,6 +149,24 @@ export default function InterviewRoom() {
     };
   }, []);
 
+  // Auto-advance questions every 90 seconds while recording
+  useEffect(() => {
+    if (interviewStarted && isChunkRecording) {
+      questionTimerRef.current = setInterval(() => {
+        setQuestionIndex((prev) =>
+          prev < INTERVIEW_QUESTIONS.length - 1 ? prev + 1 : prev
+        );
+      }, 90_000);
+    }
+    return () => {
+      if (questionTimerRef.current) {
+        clearInterval(questionTimerRef.current);
+        questionTimerRef.current = null;
+      }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [interviewStarted, isChunkRecording]);
+
   const enterFullscreen = async () => {
     if (containerRef.current && !document.fullscreenElement) {
       try {
@@ -178,26 +218,24 @@ export default function InterviewRoom() {
   };
 
   const handleLeave = async () => {
-    if (confirm('Leave the interview? Your progress will be saved.')) {
-      // Exit fullscreen first
-      await exitFullscreen();
+    // Exit fullscreen first
+    await exitFullscreen();
 
-      // Stop chunked recording (flushes final chunk)
-      if (isChunkRecording) {
-        console.log('⏹️ Stopping chunked recording ...');
-        stopRecorder();
-      }
+    // Stop chunked recording (flushes final chunk)
+    if (isChunkRecording) {
+      console.log('⏹️ Stopping chunked recording ...');
+      stopRecorder();
+    }
 
-      // Show results if we have any chunk data
-      if (chunkResults.length > 0) {
-        setVisionSessionData({ chunkResults, sessionData });
-        setShowResults(true);
-      }
-
+    // Always show results modal if interview was started
+    if (interviewStarted) {
+      setVisionSessionData({ chunkResults, sessionData });
+      setShowResults(true);
+    } else {
       setTimeout(() => {
         releaseStream();
         router.push('/');
-      }, 1500);
+      }, 500);
     }
   };
 
@@ -282,7 +320,7 @@ export default function InterviewRoom() {
           
           <button 
             onClick={() => {
-              if (confirm('Are you sure you want to end this interview?')) {
+              if (confirm('End the interview and see your results?')) {
                 handleLeave();
               }
             }}
@@ -292,6 +330,21 @@ export default function InterviewRoom() {
           </button>
         </div>
       </div>
+
+      {/* Chunk Error Toasts */}
+      {chunkErrors.length > 0 && (
+        <div className="fixed bottom-24 right-4 z-50 flex flex-col gap-2 max-w-sm">
+          {chunkErrors.map((err, i) => (
+            <div key={i} className="flex items-start gap-3 px-4 py-3 bg-red-900/80 border border-red-500/40 rounded-xl backdrop-blur-sm text-sm text-red-200 shadow-lg">
+              <svg className="w-4 h-4 mt-0.5 flex-shrink-0 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span className="flex-1 font-mono text-xs">{err}</span>
+              <button onClick={() => dismissChunkError(i)} className="text-red-400 hover:text-white">✕</button>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Main Content */}
       <div className="flex-1 flex items-center justify-center p-6 relative">
@@ -365,9 +418,36 @@ export default function InterviewRoom() {
             {interviewStarted && (
               <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent">
                 <div className="max-w-3xl mx-auto">
-                  <p className="text-sm text-purple-400 mb-2">Current Question</p>
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-sm text-purple-400">
+                      Question {questionIndex + 1} of {INTERVIEW_QUESTIONS.length}
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => setQuestionIndex((p) => Math.max(0, p - 1))}
+                        disabled={questionIndex === 0}
+                        className="px-2 py-1 text-xs text-gray-400 hover:text-white disabled:opacity-30 transition-colors"
+                      >
+                        ← Prev
+                      </button>
+                      <button
+                        onClick={() => setQuestionIndex((p) => Math.min(INTERVIEW_QUESTIONS.length - 1, p + 1))}
+                        disabled={questionIndex === INTERVIEW_QUESTIONS.length - 1}
+                        className="px-2 py-1 text-xs text-gray-400 hover:text-white disabled:opacity-30 transition-colors"
+                      >
+                        Next →
+                      </button>
+                    </div>
+                  </div>
+                  {/* Progress bar */}
+                  <div className="h-0.5 bg-white/10 rounded-full mb-3 overflow-hidden">
+                    <div
+                      className="h-full bg-purple-500 transition-all duration-500"
+                      style={{ width: `${((questionIndex + 1) / INTERVIEW_QUESTIONS.length) * 100}%` }}
+                    />
+                  </div>
                   <p className="text-lg text-white">
-                    Tell me about a time when you had to work under pressure. How did you handle it?
+                    {INTERVIEW_QUESTIONS[questionIndex]}
                   </p>
                 </div>
               </div>
@@ -482,10 +562,19 @@ export default function InterviewRoom() {
               <div className="p-4 rounded-lg bg-green-500/10 border border-white/10">
                 <div className="flex justify-between items-center mb-2">
                   <span className="text-sm text-gray-300">Facial Expression</span>
-                  <span className="text-sm font-bold text-green-400">Engaged</span>
+                  <span className="text-sm font-bold text-green-400">
+                    {latestFacialScore !== null
+                      ? `${(latestFacialScore * 100).toFixed(1)}%`
+                      : pendingChunks > 0
+                      ? 'Analyzing…'
+                      : 'Waiting…'}
+                  </span>
                 </div>
                 <div className="h-2 bg-black/30 rounded-full overflow-hidden">
-                  <div className="h-full bg-gradient-to-r from-green-500 to-emerald-400 w-[92%]" />
+                  <div
+                    className="h-full bg-gradient-to-r from-green-500 to-emerald-400 transition-all duration-500"
+                    style={{ width: latestFacialScore !== null ? `${Math.min(100, latestFacialScore * 100).toFixed(0)}%` : '0%' }}
+                  />
                 </div>
               </div>
 
@@ -531,6 +620,7 @@ export default function InterviewRoom() {
             if (isChunkRecording) {
               stopRecorder();
             } else if (cameraStream) {
+              setQuestionIndex(0);
               startRecorder(cameraStream);
             }
           }}
@@ -544,23 +634,11 @@ export default function InterviewRoom() {
         </button>
 
         {/* Share Screen */}
-        <button className="w-14 h-14 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-all">
-          <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
-          </svg>
-        </button>
-
         {/* Settings */}
-        <button className="w-14 h-14 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-all">
-          <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-          </svg>
-        </button>
 
         {/* Leave Button */}
         <button 
-          onClick={handleLeave}
+          onClick={() => { if (confirm('End the interview and see your results?')) handleLeave(); }}
           className="ml-4 px-6 py-3 bg-red-500 hover:bg-red-600 text-white font-medium rounded-full transition-all flex items-center gap-2"
         >
           <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -571,13 +649,20 @@ export default function InterviewRoom() {
       </div>
 
       {/* Results Modal */}
-      {showResults && (visionSessionData || chunkResults.length > 0) && (
+      {showResults && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-6">
           <div className="bg-gradient-to-br from-gray-900 to-gray-800 rounded-2xl border border-white/20 max-w-3xl w-full max-h-[80vh] overflow-y-auto shadow-2xl">
             {/* Header */}
             <div className="p-6 border-b border-white/10">
               <h2 className="text-2xl font-bold text-white mb-2">📊 Interview Results</h2>
-              <p className="text-gray-400 text-sm">{chunkResults.length} chunk{chunkResults.length !== 1 ? 's' : ''} analyzed</p>
+              <p className="text-gray-400 text-sm">
+                {chunkResults.length} chunk{chunkResults.length !== 1 ? 's' : ''} analyzed
+                {pendingChunks > 0 && (
+                  <span className="ml-2 text-yellow-400 animate-pulse">
+                    · {pendingChunks} still processing…
+                  </span>
+                )}
+              </p>
             </div>
 
             <div className="p-6">
@@ -601,6 +686,15 @@ export default function InterviewRoom() {
                   allPreds.length > 0
                     ? (allPreds.reduce((s, p) => s + p.confidence, 0) / allPreds.length).toFixed(3)
                     : null;
+                const avgFacial =
+                  chunkResults.filter((c) => c.facial_analysis?.score != null).length > 0
+                    ? (
+                        chunkResults
+                          .filter((c) => c.facial_analysis?.score != null)
+                          .reduce((s, c) => s + c.facial_analysis!.score!, 0) /
+                        chunkResults.filter((c) => c.facial_analysis?.score != null).length
+                      ).toFixed(3)
+                    : null;
 
                 return (
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
@@ -620,9 +714,11 @@ export default function InterviewRoom() {
                       </div>
                       <div className="text-xs text-gray-400 mt-1">Avg Confidence</div>
                     </div>
-                    <div className="bg-gradient-to-br from-pink-500/20 to-pink-600/10 p-4 rounded-lg border border-pink-500/30">
-                      <div className="text-3xl font-bold text-pink-400">{chunkResults.length}</div>
-                      <div className="text-xs text-gray-400 mt-1">Chunks Analyzed</div>
+                    <div className="bg-gradient-to-br from-green-500/20 to-green-600/10 p-4 rounded-lg border border-green-500/30">
+                      <div className="text-3xl font-bold text-green-400">
+                        {avgFacial ? `${(parseFloat(avgFacial) * 100).toFixed(0)}%` : 'N/A'}
+                      </div>
+                      <div className="text-xs text-gray-400 mt-1">Facial Expression</div>
                     </div>
                   </div>
                 );
@@ -647,6 +743,11 @@ export default function InterviewRoom() {
                               Conf: {(chunk.predictions[chunk.predictions.length - 1].confidence * 100).toFixed(0)}%
                             </span>
                           )}
+                          {chunk.facial_analysis?.score != null && (
+                            <span className="text-green-400">
+                              Facial: {(chunk.facial_analysis.score * 100).toFixed(0)}%
+                            </span>
+                          )}
                           <span className="text-gray-400">
                             Gaze: {chunk.gaze_data.filter((e) => !e.status.includes('Away')).length}/{chunk.gaze_data.length}
                           </span>
@@ -655,7 +756,9 @@ export default function InterviewRoom() {
                     </div>
                   ))}
                   {chunkResults.length === 0 && (
-                    <p className="text-gray-500 text-xs text-center py-4">No chunks analyzed yet.</p>
+                    <p className="text-gray-500 text-xs text-center py-4">
+                      {pendingChunks > 0 ? 'Waiting for first chunk to complete…' : 'No chunks analyzed yet.'}
+                    </p>
                   )}
                 </div>
               </div>
@@ -664,12 +767,19 @@ export default function InterviewRoom() {
             {/* Actions */}
             <div className="p-6 border-t border-white/10 flex gap-3">
               <button
-                onClick={() => setShowResults(false)}
+                onClick={() => {
+                  if (pendingChunks > 0) {
+                    if (!confirm(`${pendingChunks} chunk${pendingChunks !== 1 ? 's are' : ' is'} still processing. Results will be lost. Leave anyway?`)) return;
+                  }
+                  releaseStream();
+                  router.push('/');
+                }}
                 className="flex-1 px-4 py-2 bg-white/10 hover:bg-white/20 text-white rounded-lg transition-all"
               >
-                Close
+                Close & Go Home
               </button>
               <button
+                disabled={pendingChunks > 0}
                 onClick={() => {
                   const blob = new Blob(
                     [JSON.stringify({ chunkResults, sessionData }, null, 2)],
@@ -681,9 +791,12 @@ export default function InterviewRoom() {
                   a.download = `interview-results-${Date.now()}.json`;
                   a.click();
                 }}
-                className="flex-1 px-4 py-2 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white rounded-lg transition-all font-medium"
+                className="flex-1 px-4 py-2 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white rounded-lg transition-all font-medium disabled:opacity-40 disabled:cursor-not-allowed disabled:from-purple-500/50 disabled:to-pink-500/50"
+                title={pendingChunks > 0 ? `Waiting for ${pendingChunks} chunk${pendingChunks !== 1 ? 's' : ''} to finish…` : 'Download all results'}
               >
-                Download Data
+                {pendingChunks > 0
+                  ? `Waiting for ${pendingChunks} chunk${pendingChunks !== 1 ? 's' : ''}…`
+                  : 'Download Data'}
               </button>
             </div>
           </div>

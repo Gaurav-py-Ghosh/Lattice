@@ -45,6 +45,7 @@ export interface ChunkResult {
   predictions: PredictionEntry[];
   inference_summary: PredictionSummary | null;
   voice_analysis: VoiceAnalysis | null;
+  facial_analysis: { score: number | null; error: string | null } | null;
   receivedAt: string;
 }
 
@@ -74,14 +75,38 @@ export function useVisionSession() {
   const [predictions, setPredictions] = useState<PredictionEntry[]>([]);
   const [predictionSummary, setPredictionSummary] = useState<PredictionSummary | null>(null);
   const [latestConfidence, setLatestConfidence] = useState<number | null>(null);
+  const [latestFacialScore, setLatestFacialScore] = useState<number | null>(null);
 
   // Per-chunk results (chunked recording mode)
   const [chunkResults, setChunkResults] = useState<ChunkResult[]>([]);
   const [latestVoiceScore, setLatestVoiceScore] = useState<number | null>(null);
   const [processingChunks, setProcessingChunks] = useState<Set<string>>(new Set());
+  const [chunkErrors, setChunkErrors] = useState<string[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined);
+  // Outbound message queue — holds messages we tried to send while WS was not open
+  const outboundQueueRef = useRef<string[]>([]);
+  // Per-chunk timeout handles — cleared when chunk_processed/chunk_error arrives
+  const chunkTimeoutsRef = useRef<Map<string, NodeJS.Timeout>>(new Map());
+
+  const _sendOrQueue = useCallback((payload: object) => {
+    const json = JSON.stringify(payload);
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(json);
+    } else {
+      console.warn('[useVisionSession] WS not open — queuing message');
+      outboundQueueRef.current.push(json);
+    }
+  }, []);
+
+  const _clearChunkTimeout = useCallback((chunkId: string) => {
+    const handle = chunkTimeoutsRef.current.get(chunkId);
+    if (handle) {
+      clearTimeout(handle);
+      chunkTimeoutsRef.current.delete(chunkId);
+    }
+  }, []);
 
   const connect = useCallback(() => {
     try {
@@ -91,6 +116,10 @@ export function useVisionSession() {
         console.log('✓ Connected to vision server');
         setIsConnected(true);
         setError(null);
+        // Flush any queued messages
+        const queue = outboundQueueRef.current.splice(0);
+        queue.forEach((msg) => ws.send(msg));
+        if (queue.length) console.log(`[useVisionSession] Flushed ${queue.length} queued message(s)`);
       };
       
       ws.onmessage = (event) => {
@@ -134,6 +163,7 @@ export function useVisionSession() {
             break;
 
           case 'chunk_processed': {
+            _clearChunkTimeout(message.chunk_id);
             const result: ChunkResult = {
               chunkId: message.chunk_id,
               chunkIndex: message.chunk_index ?? 0,
@@ -141,10 +171,11 @@ export function useVisionSession() {
               predictions: message.predictions || [],
               inference_summary: message.inference_summary || null,
               voice_analysis: message.voice_analysis || null,
+              facial_analysis: message.facial_analysis || null,
               receivedAt: new Date().toISOString(),
             };
             console.log(
-              `📦 Chunk processed: ${result.chunkId} | voice=${result.voice_analysis?.score?.toFixed(3)} | gaze=${result.gaze_data.length} events`
+              `📦 Chunk processed: ${result.chunkId} | voice=${result.voice_analysis?.score?.toFixed(3)} | confidence=${result.predictions[0]?.confidence?.toFixed(3)} | facial=${result.facial_analysis?.score?.toFixed(3)} | gaze=${result.gaze_data.length} events`
             );
             setChunkResults((prev) => [...prev, result]);
             if (result.voice_analysis?.score != null) {
@@ -153,6 +184,9 @@ export function useVisionSession() {
             if (result.predictions.length > 0) {
               const lastConf = result.predictions[result.predictions.length - 1].confidence;
               setLatestConfidence(lastConf);
+            }
+            if (result.facial_analysis?.score != null) {
+              setLatestFacialScore(result.facial_analysis.score);
             }
             setProcessingChunks((prev) => {
               const next = new Set(prev);
@@ -164,6 +198,8 @@ export function useVisionSession() {
 
           case 'chunk_error':
             console.error('Chunk processing error:', message.chunk_id, message.message);
+            _clearChunkTimeout(message.chunk_id);
+            setChunkErrors((prev) => [...prev, `Chunk ${message.chunk_id?.slice(0, 8)}: ${message.message ?? 'unknown error'}`]);
             setProcessingChunks((prev) => {
               const next = new Set(prev);
               next.delete(message.chunk_id);
@@ -211,7 +247,7 @@ export function useVisionSession() {
       console.error('Failed to create WebSocket:', err);
       setError('Failed to connect to vision server');
     }
-  }, []);
+  }, [_clearChunkTimeout]);
 
   const disconnect = useCallback(() => {
     if (reconnectTimeoutRef.current) {
@@ -229,38 +265,38 @@ export function useVisionSession() {
    * by POST /upload_video. Used for post-interview analysis of the full recording.
    */
   const startSession = useCallback((videoPath: string) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      setError('Not connected to server');
-      return;
-    }
-    wsRef.current.send(JSON.stringify({
-      action: 'start_session',
-      video_path: videoPath,
-    }));
-  }, []);
+    _sendOrQueue({ action: 'start_session', video_path: videoPath });
+  }, [_sendOrQueue]);
 
   /**
    * Send a 15-s video chunk to the server for parallel processing:
-   * vision.py (gaze) + realtime_inference (confidence) + voice_analyzer.
+   * vision.py (gaze) + VideoMAE (confidence) + FacialExpression + voice_analyzer.
    */
   const processChunk = useCallback(
     (videoPath: string, chunkId: string, chunkIndex: number = 0) => {
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        setError('Not connected to server');
-        return;
-      }
       setProcessingChunks((prev) => new Set(prev).add(chunkId));
-      wsRef.current.send(
-        JSON.stringify({
-          action: 'process_chunk',
-          video_path: videoPath,
-          chunk_id: chunkId,
-          chunk_index: chunkIndex,
-        })
-      );
-      console.log(`[useVisionSession] process_chunk sent: ${chunkId} → ${videoPath}`);
+
+      // 2-minute timeout — if server never responds, clear the spinner
+      const timeoutHandle = setTimeout(() => {
+        console.warn(`[useVisionSession] Chunk ${chunkId} timed out after 120s`);
+        setProcessingChunks((prev) => {
+          const next = new Set(prev);
+          next.delete(chunkId);
+          return next;
+        });
+        chunkTimeoutsRef.current.delete(chunkId);
+      }, 120_000);
+      chunkTimeoutsRef.current.set(chunkId, timeoutHandle);
+
+      _sendOrQueue({
+        action: 'process_chunk',
+        video_path: videoPath,
+        chunk_id: chunkId,
+        chunk_index: chunkIndex,
+      });
+      console.log(`[useVisionSession] process_chunk sent/queued: ${chunkId} → ${videoPath}`);
     },
-    []
+    [_sendOrQueue]
   );
 
   const stopSession = useCallback(() => {
@@ -279,6 +315,12 @@ export function useVisionSession() {
     
     wsRef.current.send(JSON.stringify({ action: 'get_status' }));
   }, []);
+
+  const clearChunkErrors = useCallback(() => setChunkErrors([]), []);
+  const dismissChunkError = useCallback(
+    (index: number) => setChunkErrors((prev) => prev.filter((_, i) => i !== index)),
+    []
+  );
 
   // Auto-connect on mount
   useEffect(() => {
@@ -302,8 +344,12 @@ export function useVisionSession() {
     // Per-chunk state
     chunkResults,
     latestVoiceScore,
+    latestFacialScore,
     processingChunks,
     pendingChunks: processingChunks.size,
+    chunkErrors,
+    clearChunkErrors,
+    dismissChunkError,
     
     // Real-time prediction state
     predictions,

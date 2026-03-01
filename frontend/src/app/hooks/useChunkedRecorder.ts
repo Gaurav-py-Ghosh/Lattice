@@ -35,6 +35,7 @@ export function useChunkedRecorder({ onChunkReady, onError }: ChunkedRecorderOpt
   const streamRef = useRef<MediaStream | null>(null);
   const cycleIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const mimeTypeRef = useRef('');
+  const stoppedRef = useRef(false);  // prevents startOneRecorder after stop() is called
 
   // ------------------------------------------------------------------
   // Permissions + stream acquisition
@@ -78,6 +79,7 @@ export function useChunkedRecorder({ onChunkReady, onError }: ChunkedRecorderOpt
   // ------------------------------------------------------------------
   const startOneRecorder = useCallback(
     (s: MediaStream, mimeType: string) => {
+      if (stoppedRef.current) return;  // guard: don't start after stop() called
       const recorder = new MediaRecorder(s, mimeType ? { mimeType } : undefined);
       mediaRecorderRef.current = recorder;
 
@@ -125,11 +127,12 @@ export function useChunkedRecorder({ onChunkReady, onError }: ChunkedRecorderOpt
       if (cycleIntervalRef.current) return; // already running
 
       const mimeType =
-        ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'].find(
+        ['video/webm;codecs=vp8,opus', 'video/mp4', 'video/webm', 'video/webm;codecs=vp9,opus'].find(
           (m) => MediaRecorder.isTypeSupported(m)
         ) ?? '';
       mimeTypeRef.current = mimeType;
       chunkIndexRef.current = 0;
+      stoppedRef.current = false;  // reset for this recording session
 
       // Start the first recorder immediately
       startOneRecorder(s, mimeType);
@@ -150,6 +153,7 @@ export function useChunkedRecorder({ onChunkReady, onError }: ChunkedRecorderOpt
   );
 
   const stop = useCallback(() => {
+    stoppedRef.current = true;  // must be set BEFORE clearing interval to prevent race
     if (cycleIntervalRef.current) {
       clearInterval(cycleIntervalRef.current);
       cycleIntervalRef.current = null;
