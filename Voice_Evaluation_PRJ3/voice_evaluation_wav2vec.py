@@ -166,7 +166,10 @@ def plot_single_report(score, percentile,
     plt.show()
 
     print("\nOverall Speaking Skills Score:", round(score, 4))
-    print("Percentile vs Dataset:", round(percentile, 2), "%")
+    if percentile is not None:
+        print("Percentile vs Dataset:", round(percentile, 2), "%")
+    else:
+        print("Percentile vs Dataset: N/A (no reference dataset loaded)")
     print()
 
 
@@ -197,7 +200,7 @@ def plot_comparison_report(r1, r2):
 if __name__ == "__main__":
 
     model, device = load_model()
-    dataset_scores = load_dataset_scores()
+    dataset_scores = None
 
     print("Select analysis type:")
     print("1 - Single analysis")
@@ -213,8 +216,8 @@ if __name__ == "__main__":
         wav_path = prepare_input(path, idx)
         waveform = load_waveform(wav_path)
         score = predict_score(model, device, waveform)
-        percentile = percentileofscore(dataset_scores, score)
-
+        # percentile = percentileofscore(dataset_scores, score)
+        percentile = None
         times, window_scores = sliding_window_analysis(
             model, device, waveform
         )

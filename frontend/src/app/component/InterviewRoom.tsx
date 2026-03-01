@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useVisionSession } from '../hooks/useVisionSession';
+import { useChunkedRecorder } from '../hooks/useChunkedRecorder';
 import CalibrationFlow from './CalibrationFlow';
 
 export default function InterviewRoom() {
@@ -11,37 +12,62 @@ export default function InterviewRoom() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   
-  const [stream, setStream] = useState<MediaStream | null>(null);
   const [recordingTime, setRecordingTime] = useState(0);
-  const [isRecording, setIsRecording] = useState(false);
   const [showCalibration, setShowCalibration] = useState(true);
   const [interviewStarted, setInterviewStarted] = useState(false);
   const [visionSessionData, setVisionSessionData] = useState<any>(null);
   const [showResults, setShowResults] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [permissionStatus, setPermissionStatus] = useState<'pending' | 'granted' | 'denied'>('pending');
 
   // Vision.py session hook
   const {
     isConnected: visionConnected,
-    isSessionActive: visionActive,
     sessionData,
-    predictions,
-    predictionSummary,
     latestConfidence,
-    startSession: startVisionSession,
-    stopSession: stopVisionSession,
+    chunkResults,
+    latestVoiceScore,
+    pendingChunks,
+    processChunk,
     error: visionError,
   } = useVisionSession();
 
-  // CAMERA IS HANDLED BY VISION.PY - Don't initialize here to avoid conflicts
-  // Vision.py will have exclusive camera access with its debug window
+  // Chunked recorder — 15-s chunks auto-uploaded to vision_server
+  const {
+    stream: cameraStream,
+    isRecording: isChunkRecording,
+    chunkCount,
+    permissionGranted,
+    permissionError,
+    requestPermissions,
+    start: startRecorder,
+    stop: stopRecorder,
+    releaseStream,
+  } = useChunkedRecorder({
+    onChunkReady: (videoPath, chunkId, chunkIndex) => {
+      console.log(`📦 Chunk ${chunkIndex} ready: ${videoPath}`);
+      processChunk(videoPath, chunkId, chunkIndex);
+    },
+    onError: (msg) => console.error('[Recorder]', msg),
+  });
+
+  // Request camera + microphone on mount and feed stream into video element
   useEffect(() => {
-    // Just set a dummy stream to satisfy video element requirements
-    console.log('📷 Camera will be handled by vision.py window');
+    requestPermissions().then((s) => {
+      if (s) {
+        setPermissionStatus('granted');
+        if (videoRef.current) {
+          videoRef.current.srcObject = s;
+        }
+      } else {
+        setPermissionStatus('denied');
+      }
+    });
 
     return () => {
-      // No cleanup needed - vision.py handles camera
+      releaseStream();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Vision.py handles gaze tracking - we don't use the old gaze tracking hook
@@ -66,12 +92,12 @@ export default function InterviewRoom() {
   //   };
   // }, [interviewStarted, connected, startTracking, stopTracking, isTracking]);
 
-  // Recording timer
+  // Recording timer tied to chunked recorder
   useEffect(() => {
     let timer: NodeJS.Timeout;
-    if (isRecording) {
+    if (isChunkRecording) {
       timer = setInterval(() => {
-        setRecordingTime(prev => prev + 1);
+        setRecordingTime((prev) => prev + 1);
       }, 1000);
     } else {
       setRecordingTime(0);
@@ -79,16 +105,15 @@ export default function InterviewRoom() {
     return () => {
       if (timer) clearInterval(timer);
     };
-  }, [isRecording]);
+  }, [isChunkRecording]);
 
-  // Handle vision session end
+  // Show results when chunks have been analyzed and recording stops
   useEffect(() => {
-    if (sessionData && !visionActive) {
-      console.log('📊 Vision session ended, got data:', sessionData);
-      setVisionSessionData(sessionData);
-      setShowResults(true);
+    if (chunkResults.length > 0 && !isChunkRecording && interviewStarted) {
+      console.log('📊 Got chunk results:', chunkResults.length);
+      setVisionSessionData({ chunkResults, sessionData });
     }
-  }, [sessionData, visionActive]);
+  }, [chunkResults, isChunkRecording, interviewStarted, sessionData]);
 
   // Handle fullscreen changes
   useEffect(() => {
@@ -127,14 +152,22 @@ export default function InterviewRoom() {
   const handleCalibrationComplete = () => {
     setShowCalibration(false);
     setInterviewStarted(true);
-    
+
     // Enter fullscreen mode
     enterFullscreen();
-    
-    // Start vision.py session when interview starts
-    if (visionConnected && !visionActive) {
-      console.log('🎥 Starting vision.py session in headless mode (no windows)...');
-      startVisionSession(true); // headless=true: no OpenCV windows
+
+    // Start 15-s chunk recording now that permissions are already granted
+    if (permissionGranted && cameraStream) {
+      console.log('🎥 Starting chunked recording (15-s chunks) ...');
+      startRecorder(cameraStream);
+    } else {
+      console.warn('Camera stream not ready — requesting permissions again');
+      requestPermissions().then((s) => {
+        if (s) {
+          startRecorder(s);
+          if (videoRef.current) videoRef.current.srcObject = s;
+        }
+      });
     }
   };
 
@@ -148,17 +181,23 @@ export default function InterviewRoom() {
     if (confirm('Leave the interview? Your progress will be saved.')) {
       // Exit fullscreen first
       await exitFullscreen();
-      
-      // Stop vision session and wait for results
-      if (visionActive) {
-        console.log('⏹️ Stopping vision.py session...');
-        stopVisionSession();
+
+      // Stop chunked recording (flushes final chunk)
+      if (isChunkRecording) {
+        console.log('⏹️ Stopping chunked recording ...');
+        stopRecorder();
       }
-      
-      // Wait a moment for session data to arrive
+
+      // Show results if we have any chunk data
+      if (chunkResults.length > 0) {
+        setVisionSessionData({ chunkResults, sessionData });
+        setShowResults(true);
+      }
+
       setTimeout(() => {
+        releaseStream();
         router.push('/');
-      }, 1000);
+      }, 1500);
     }
   };
 
@@ -181,17 +220,16 @@ export default function InterviewRoom() {
             AI
           </div>
           <span className="text-xl font-bold tracking-tight">InterviewAR</span>
-          {isRecording && (
+          {isChunkRecording && (
             <div className="flex items-center gap-2 px-3 py-1 bg-red-500/20 border border-red-500/30 rounded-full">
               <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-              <span className="text-sm text-red-400 font-mono">{formatTime(recordingTime)}</span>
+              <span className="text-sm text-red-400 font-mono">● Chunk {chunkCount} | {formatTime(recordingTime)}</span>
             </div>
           )}
-          {/* Vision.py Session Indicator */}
-          {visionActive && (
-            <div className="flex items-center gap-2 px-3 py-1 bg-purple-500/20 border border-purple-500/30 rounded-full">
-              <div className="w-2 h-2 bg-purple-500 rounded-full animate-pulse" />
-              <span className="text-sm text-purple-400 font-mono">👁️ Gaze Tracking</span>
+          {pendingChunks > 0 && (
+            <div className="flex items-center gap-2 px-3 py-1 bg-yellow-500/20 border border-yellow-500/30 rounded-full">
+              <div className="w-2 h-2 bg-yellow-500 rounded-full animate-pulse" />
+              <span className="text-sm text-yellow-400 font-mono">Analyzing {pendingChunks} chunk{pendingChunks !== 1 ? 's' : ''}…</span>
             </div>
           )}
         </div>
@@ -233,22 +271,11 @@ export default function InterviewRoom() {
               <span className="text-green-400">Vision Server</span>
             </div>
           )}
-          {/* Manual Vision Control */}
-          {!visionActive && visionConnected && interviewStarted && (
-            <button
-              onClick={() => startVisionSession(true)} // headless=true
-              className="px-3 py-1.5 bg-green-500/20 hover:bg-green-500/30 text-green-400 text-sm font-medium rounded-lg transition-all border border-green-500/30"
-            >
-              Start Gaze Track
-            </button>
-          )}
-          {visionActive && (
-            <button
-              onClick={stopVisionSession}
-              className="px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 text-red-400 text-sm font-medium rounded-lg transition-all border border-red-500/30"
-            >
-              Stop Gaze Track
-            </button>
+          {/* Permission Status */}
+          {permissionStatus === 'denied' && (
+            <div className="px-3 py-1.5 bg-red-500/20 border border-red-500/30 rounded-lg text-xs text-red-400">
+              Camera/Mic Denied
+            </div>
           )}
 
 
@@ -275,52 +302,51 @@ export default function InterviewRoom() {
 
         {/* Video Container */}
         <div className="relative w-full max-w-5xl aspect-video">
-          {/* Main Video Feed - Managed by Vision.py */}
-          <div className="relative w-full h-full bg-gradient-to-br from-gray-900 via-purple-900/20 to-gray-900 rounded-2xl overflow-hidden border-2 border-white/10 shadow-2xl">
-            
-            {/* Vision.py Window Indicator */}
-            <div className="absolute inset-0 flex items-center justify-center">
-              <div className="text-center max-w-md p-8">
-                {visionActive ? (
-                  <>
-                    <div className="w-32 h-32 mx-auto mb-6 bg-gradient-to-br from-purple-500/20 to-pink-500/20 rounded-full flex items-center justify-center border-4 border-purple-500/30 animate-pulse">
-                      <svg className="w-16 h-16 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                      </svg>
-                    </div>
-                    <h3 className="text-2xl font-bold text-white mb-3">
-                      👁️ Gaze Tracking Active
-                    </h3>
-                    <p className="text-gray-400 mb-4">
-                      Check the <span className="text-purple-400 font-semibold">Vision.py window</span> for camera feed and calibration
-                    </p>
-                    <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-4 text-sm text-gray-300">
-                      <p className="mb-2">
-                        <span className="text-purple-400 font-mono">Press 'C'</span> in vision window to calibrate
-                      </p>
-                      <p>
-                        <span className="text-purple-400 font-mono">Press 'X'</span> to add markers
-                      </p>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <div className="w-32 h-32 mx-auto mb-6 bg-white/5 rounded-full flex items-center justify-center border-4 border-white/10">
-                      <svg className="w-16 h-16 text-white/30" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                        <line x1="3" y1="3" x2="21" y2="21" stroke="currentColor" strokeWidth="2"/>
-                      </svg>
-                    </div>
-                    <h3 className="text-xl font-bold text-white mb-3">
-                      Camera Not Active
-                    </h3>
-                    <p className="text-gray-400">
-                      Complete calibration to start vision tracking
-                    </p>
-                  </>
-                )}
+          {/* Live camera feed (browser-side) */}
+          <div className="relative w-full h-full bg-black rounded-2xl overflow-hidden border-2 border-white/10 shadow-2xl">
+
+            {/* Live video preview */}
+            <video
+              ref={videoRef}
+              autoPlay
+              muted
+              playsInline
+              className={`w-full h-full object-cover ${
+                permissionStatus === 'granted' ? 'block' : 'hidden'
+              }`}
+            />
+
+            {/* Permission / waiting state */}
+            {permissionStatus !== 'granted' && (
+              <div className="absolute inset-0 flex items-center justify-center">
+                <div className="text-center max-w-md p-8">
+                  <div className="w-24 h-24 mx-auto mb-6 bg-white/5 rounded-full flex items-center justify-center border-4 border-white/10">
+                    <svg className="w-12 h-12 text-white/40" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                    </svg>
+                  </div>
+                  {permissionStatus === 'pending' ? (
+                    <>
+                      <h3 className="text-xl font-bold text-white mb-2">Requesting Camera & Mic</h3>
+                      <p className="text-gray-400 text-sm">Please allow access in your browser prompt.</p>
+                    </>
+                  ) : (
+                    <>
+                      <h3 className="text-xl font-bold text-red-400 mb-2">Permission Denied</h3>
+                      <p className="text-gray-400 text-sm">{permissionError ?? 'Enable camera and microphone access, then refresh.'}</p>
+                    </>
+                  )}
+                </div>
               </div>
-            </div>
+            )}
+
+            {/* Recording badge */}
+            {isChunkRecording && (
+              <div className="absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 bg-red-600/80 backdrop-blur-sm rounded-full">
+                <div className="w-2 h-2 bg-white rounded-full animate-pulse" />
+                <span className="text-xs font-semibold text-white">REC</span>
+              </div>
+            )}
 
             {/* Tracking Status Badge */}
             <div className="absolute top-4 right-4 px-3 py-2 bg-gradient-to-br from-purple-500/80 to-pink-500/80 backdrop-blur-sm rounded-lg border border-white/30">
@@ -368,13 +394,31 @@ export default function InterviewRoom() {
                 <div className="flex justify-between items-center mb-2">
                   <span className="text-sm text-gray-300">Eye Contact</span>
                   <span className="text-sm font-bold text-purple-400">
-                    {visionActive ? 'Tracking...' : 'Waiting...'}
+                    {chunkResults.length > 0
+                      ? (() => {
+                          const total = chunkResults.reduce((s, c) => s + c.gaze_data.length, 0);
+                          const focused = chunkResults.reduce(
+                            (s, c) => s + c.gaze_data.filter((e) => !e.status.includes('Away')).length, 0
+                          );
+                          return total > 0 ? `${((focused / total) * 100).toFixed(0)}%` : 'Tracking…';
+                        })()
+                      : 'Tracking…'}
                   </span>
                 </div>
                 <div className="h-2 bg-black/30 rounded-full overflow-hidden">
-                  <div 
+                  <div
                     className="h-full transition-all duration-300 bg-purple-500"
-                    style={{ width: visionActive ? '75%' : '0%' }}
+                    style={{
+                      width: chunkResults.length > 0
+                        ? (() => {
+                            const total = chunkResults.reduce((s, c) => s + c.gaze_data.length, 0);
+                            const focused = chunkResults.reduce(
+                              (s, c) => s + c.gaze_data.filter((e) => !e.status.includes('Away')).length, 0
+                            );
+                            return total > 0 ? `${((focused / total) * 100).toFixed(0)}%` : '0%';
+                          })()
+                        : '0%',
+                    }}
                   />
                 </div>
               </div>
@@ -384,40 +428,53 @@ export default function InterviewRoom() {
                 <div className="flex justify-between items-center mb-2">
                   <span className="text-sm text-gray-300">AI Confidence Score</span>
                   <span className="text-sm font-bold text-blue-400">
-                    {latestConfidence !== null 
+                    {latestConfidence !== null
                       ? `${(latestConfidence * 100).toFixed(1)}%`
-                      : predictions.length > 0
-                      ? `${(predictionSummary?.mean_confidence ?? 0 * 100).toFixed(1)}%`
-                      : 'Analyzing...'}
+                      : chunkResults.length > 0
+                      ? (() => {
+                          const allPreds = chunkResults.flatMap((c) => c.predictions);
+                          const avg = allPreds.length > 0
+                            ? allPreds.reduce((s, p) => s + p.confidence, 0) / allPreds.length
+                            : null;
+                          return avg !== null ? `${(avg * 100).toFixed(1)}%` : 'Analyzing…';
+                        })()
+                      : 'Analyzing…'}
                   </span>
                 </div>
                 <div className="h-2 bg-black/30 rounded-full overflow-hidden">
-                  <div 
+                  <div
                     className="h-full bg-gradient-to-r from-blue-500 to-cyan-400 transition-all duration-500"
-                    style={{ 
-                      width: latestConfidence !== null 
+                    style={{
+                      width: latestConfidence !== null
                         ? `${Math.max(0, Math.min(100, latestConfidence * 100))}%`
-                        : predictions.length > 0
-                        ? `${Math.max(0, Math.min(100, (predictionSummary?.mean_confidence ?? 0) * 100))}%`
                         : '0%'
                     }}
                   />
                 </div>
-                {predictions.length > 0 && (
+                {chunkResults.length > 0 && (
                   <div className="mt-2 text-xs text-gray-500">
-                    Based on {predictions.length} chunk{predictions.length !== 1 ? 's' : ''} analyzed
+                    Based on {chunkResults.length} chunk{chunkResults.length !== 1 ? 's' : ''} analyzed
                   </div>
                 )}
               </div>
 
-              {/* Speaking Pace */}
-              <div className="p-4 rounded-lg bg-purple-500/10 border border-white/10">
+              {/* Voice Analysis Score */}
+              <div className="p-4 rounded-lg bg-emerald-500/10 border border-white/10">
                 <div className="flex justify-between items-center mb-2">
-                  <span className="text-sm text-gray-300">Speaking Pace</span>
-                  <span className="text-sm font-bold text-purple-400">Normal</span>
+                  <span className="text-sm text-gray-300">Voice Skills</span>
+                  <span className="text-sm font-bold text-emerald-400">
+                    {latestVoiceScore !== null
+                      ? `${(latestVoiceScore * 100).toFixed(1)}%`
+                      : pendingChunks > 0
+                      ? 'Analyzing…'
+                      : 'Waiting…'}
+                  </span>
                 </div>
                 <div className="h-2 bg-black/30 rounded-full overflow-hidden">
-                  <div className="h-full bg-gradient-to-r from-purple-500 to-pink-400 w-[75%]" />
+                  <div
+                    className="h-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all duration-500"
+                    style={{ width: latestVoiceScore !== null ? `${Math.min(100, latestVoiceScore * 100).toFixed(0)}%` : '0%' }}
+                  />
                 </div>
               </div>
 
@@ -440,14 +497,14 @@ export default function InterviewRoom() {
                   </svg>
                   <div>
                     <p className="text-sm font-medium text-yellow-400 mb-1">
-                      {predictions.length > 0 ? 'AI Analysis Active' : 'Tip'}
+                      {chunkResults.length > 0 ? 'AI Analysis Active' : 'Tip'}
                     </p>
                     <p className="text-sm text-gray-400">
-                      {predictions.length > 0
-                        ? `VideoMAE is analyzing your interview in real-time. ${predictions.length} chunk${predictions.length !== 1 ? 's' : ''} processed so far.`
-                        : visionActive 
-                        ? 'Maintain eye contact with the camera. AI analysis will begin after 15 seconds.'
-                        : 'Start your interview to begin gaze tracking and AI analysis.'}
+                      {chunkResults.length > 0
+                        ? `${chunkResults.length} chunk${chunkResults.length !== 1 ? 's' : ''} analyzed.${pendingChunks > 0 ? ` ${pendingChunks} processing…` : ''}`
+                        : isChunkRecording
+                        ? 'Recording in progress. First AI scores appear after 15 seconds.'
+                        : 'Complete calibration to begin recording and AI analysis.'}
                     </p>
                   </div>
                 </div>
@@ -460,24 +517,30 @@ export default function InterviewRoom() {
       {/* Control Bar */}
       <div className="px-6 py-6 border-t border-white/10 flex items-center justify-center gap-4">
         
-        {/* Vision.py Status Indicator */}
-        {visionActive && (
-          <div className="flex items-center gap-2 px-4 py-2 bg-purple-500/20 border border-purple-500/30 rounded-full">
-            <div className="w-2 h-2 bg-purple-500 rounded-full animate-pulse" />
-            <span className="text-sm text-purple-400">Vision Window Active</span>
+        {/* Recording / Processing Indicator */}
+        {isChunkRecording && (
+          <div className="flex items-center gap-2 px-4 py-2 bg-red-500/20 border border-red-500/30 rounded-full">
+            <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+            <span className="text-sm text-red-400">Recording — Chunk {chunkCount}</span>
           </div>
         )}
 
         {/* Record Control */}
         <button
-          onClick={() => setIsRecording(!isRecording)}
+          onClick={() => {
+            if (isChunkRecording) {
+              stopRecorder();
+            } else if (cameraStream) {
+              startRecorder(cameraStream);
+            }
+          }}
           className={`w-14 h-14 rounded-full flex items-center justify-center transition-all ${
-            isRecording
+            isChunkRecording
               ? 'bg-red-500 hover:bg-red-600 text-white animate-pulse'
               : 'bg-white/10 hover:bg-white/20 text-white'
           }`}
         >
-          <div className={`w-6 h-6 ${isRecording ? 'rounded-sm' : 'rounded-full'} bg-white transition-all`} />
+          <div className={`w-6 h-6 ${isChunkRecording ? 'rounded-sm' : 'rounded-full'} bg-white transition-all`} />
         </button>
 
         {/* Share Screen */}
@@ -507,98 +570,93 @@ export default function InterviewRoom() {
         </button>
       </div>
 
-      {/* Vision Session Results Modal */}
-      {showResults && visionSessionData && (
+      {/* Results Modal */}
+      {showResults && (visionSessionData || chunkResults.length > 0) && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-6">
           <div className="bg-gradient-to-br from-gray-900 to-gray-800 rounded-2xl border border-white/20 max-w-3xl w-full max-h-[80vh] overflow-y-auto shadow-2xl">
             {/* Header */}
             <div className="p-6 border-b border-white/10">
-              <h2 className="text-2xl font-bold text-white mb-2">📊 Gaze Tracking Results</h2>
-              <p className="text-gray-400 text-sm">Session completed successfully</p>
+              <h2 className="text-2xl font-bold text-white mb-2">📊 Interview Results</h2>
+              <p className="text-gray-400 text-sm">{chunkResults.length} chunk{chunkResults.length !== 1 ? 's' : ''} analyzed</p>
             </div>
 
-            {/* Stats Grid */}
             <div className="p-6">
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-                {(() => {
-                  const total = visionSessionData.log_data?.length || 0;
-                  const focusedCount = visionSessionData.log_data?.filter((e: any) => 
-                    !e.status.includes('Away')
-                  ).length || 0;
-                  const focusPercentage = total > 0 ? ((focusedCount / total) * 100).toFixed(1) : '0';
-                  const lookingAwayCount = total - focusedCount;
-                  
-                  return (
-                    <>
-                      <div className="bg-gradient-to-br from-blue-500/20 to-blue-600/10 p-4 rounded-lg border border-blue-500/30">
-                        <div className="text-3xl font-bold text-blue-400">{focusPercentage}%</div>
-                        <div className="text-xs text-gray-400 mt-1">Focus Score</div>
-                      </div>
-                      <div className="bg-gradient-to-br from-green-500/20 to-green-600/10 p-4 rounded-lg border border-green-500/30">
-                        <div className="text-3xl font-bold text-green-400">{focusedCount}</div>
-                        <div className="text-xs text-gray-400 mt-1">Focused</div>
-                      </div>
-                      <div className="bg-gradient-to-br from-red-500/20 to-red-600/10 p-4 rounded-lg border border-red-500/30">
-                        <div className="text-3xl font-bold text-red-400">{lookingAwayCount}</div>
-                        <div className="text-xs text-gray-400 mt-1">Looking Away</div>
-                      </div>
-                      <div className="bg-gradient-to-br from-purple-500/20 to-purple-600/10 p-4 rounded-lg border border-purple-500/30">
-                        <div className="text-3xl font-bold text-purple-400">{total}</div>
-                        <div className="text-xs text-gray-400 mt-1">Total Events</div>
-                      </div>
-                    </>
-                  );
-                })()}
-              </div>
+              {/* Aggregated Stats */}
+              {(() => {
+                const allGaze = chunkResults.flatMap((c) => c.gaze_data);
+                const total = allGaze.length;
+                const focused = allGaze.filter((e) => !e.status.includes('Away')).length;
+                const focusPct = total > 0 ? ((focused / total) * 100).toFixed(1) : '0';
+                const avgVoice =
+                  chunkResults.filter((c) => c.voice_analysis?.score != null).length > 0
+                    ? (
+                        chunkResults
+                          .filter((c) => c.voice_analysis?.score != null)
+                          .reduce((s, c) => s + c.voice_analysis!.score!, 0) /
+                        chunkResults.filter((c) => c.voice_analysis?.score != null).length
+                      ).toFixed(3)
+                    : null;
+                const allPreds = chunkResults.flatMap((c) => c.predictions);
+                const avgConf =
+                  allPreds.length > 0
+                    ? (allPreds.reduce((s, p) => s + p.confidence, 0) / allPreds.length).toFixed(3)
+                    : null;
 
-              {/* Session Info */}
-              <div className="bg-white/5 p-4 rounded-lg mb-6 border border-white/10">
-                <div className="text-xs text-gray-400 space-y-2">
-                  <div className="flex justify-between">
-                    <span>Session ID:</span>
-                    <span className="font-mono text-gray-300">{visionSessionData.session_id?.slice(0, 12)}...</span>
+                return (
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                    <div className="bg-gradient-to-br from-blue-500/20 to-blue-600/10 p-4 rounded-lg border border-blue-500/30">
+                      <div className="text-3xl font-bold text-blue-400">{focusPct}%</div>
+                      <div className="text-xs text-gray-400 mt-1">Focus Score</div>
+                    </div>
+                    <div className="bg-gradient-to-br from-emerald-500/20 to-emerald-600/10 p-4 rounded-lg border border-emerald-500/30">
+                      <div className="text-3xl font-bold text-emerald-400">
+                        {avgVoice ? `${(parseFloat(avgVoice) * 100).toFixed(0)}%` : 'N/A'}
+                      </div>
+                      <div className="text-xs text-gray-400 mt-1">Voice Skills</div>
+                    </div>
+                    <div className="bg-gradient-to-br from-purple-500/20 to-purple-600/10 p-4 rounded-lg border border-purple-500/30">
+                      <div className="text-3xl font-bold text-purple-400">
+                        {avgConf ? `${(parseFloat(avgConf) * 100).toFixed(0)}%` : 'N/A'}
+                      </div>
+                      <div className="text-xs text-gray-400 mt-1">Avg Confidence</div>
+                    </div>
+                    <div className="bg-gradient-to-br from-pink-500/20 to-pink-600/10 p-4 rounded-lg border border-pink-500/30">
+                      <div className="text-3xl font-bold text-pink-400">{chunkResults.length}</div>
+                      <div className="text-xs text-gray-400 mt-1">Chunks Analyzed</div>
+                    </div>
                   </div>
-                  <div className="flex justify-between">
-                    <span>Started:</span>
-                    <span className="font-mono text-gray-300">
-                      {new Date(visionSessionData.start_time).toLocaleTimeString()}
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>Ended:</span>
-                    <span className="font-mono text-gray-300">
-                      {new Date(visionSessionData.end_time).toLocaleTimeString()}
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>Duration:</span>
-                    <span className="font-mono text-gray-300">
-                      {Math.round((new Date(visionSessionData.end_time).getTime() - 
-                                   new Date(visionSessionData.start_time).getTime()) / 1000)}s
-                    </span>
-                  </div>
-                </div>
-              </div>
+                );
+              })()}
 
-              {/* Timeline */}
+              {/* Per-chunk breakdown */}
               <div className="bg-white/5 p-4 rounded-lg border border-white/10 max-h-64 overflow-y-auto">
-                <h3 className="text-sm font-semibold text-white mb-3">Gaze Timeline (Last 20)</h3>
+                <h3 className="text-sm font-semibold text-white mb-3">Per-Chunk Breakdown</h3>
                 <div className="space-y-2">
-                  {visionSessionData.log_data?.slice(-20).reverse().map((entry: any, idx: number) => (
-                    <div 
-                      key={idx}
-                      className={`text-xs p-2 rounded ${
-                        entry.status.includes('Away')
-                          ? 'bg-red-500/10 border-l-2 border-red-500'
-                          : 'bg-green-500/10 border-l-2 border-green-500'
-                      }`}
-                    >
-                      <span className="font-mono text-gray-400">
-                        {new Date(entry.timestamp).toLocaleTimeString()}
-                      </span>
-                      <span className="ml-3 text-gray-300">{entry.status}</span>
+                  {chunkResults.map((chunk, idx) => (
+                    <div key={chunk.chunkId} className="text-xs p-3 rounded bg-white/5 border border-white/10">
+                      <div className="flex justify-between items-center">
+                        <span className="font-mono text-gray-400">Chunk {idx + 1}</span>
+                        <div className="flex gap-3">
+                          {chunk.voice_analysis?.score != null && (
+                            <span className="text-emerald-400">
+                              Voice: {(chunk.voice_analysis.score * 100).toFixed(0)}%
+                            </span>
+                          )}
+                          {chunk.predictions.length > 0 && (
+                            <span className="text-purple-400">
+                              Conf: {(chunk.predictions[chunk.predictions.length - 1].confidence * 100).toFixed(0)}%
+                            </span>
+                          )}
+                          <span className="text-gray-400">
+                            Gaze: {chunk.gaze_data.filter((e) => !e.status.includes('Away')).length}/{chunk.gaze_data.length}
+                          </span>
+                        </div>
+                      </div>
                     </div>
                   ))}
+                  {chunkResults.length === 0 && (
+                    <p className="text-gray-500 text-xs text-center py-4">No chunks analyzed yet.</p>
+                  )}
                 </div>
               </div>
             </div>
@@ -613,12 +671,14 @@ export default function InterviewRoom() {
               </button>
               <button
                 onClick={() => {
-                  // Download data as JSON
-                  const blob = new Blob([JSON.stringify(visionSessionData, null, 2)], { type: 'application/json' });
+                  const blob = new Blob(
+                    [JSON.stringify({ chunkResults, sessionData }, null, 2)],
+                    { type: 'application/json' }
+                  );
                   const url = URL.createObjectURL(blob);
                   const a = document.createElement('a');
                   a.href = url;
-                  a.download = `gaze-session-${visionSessionData.session_id.slice(0, 8)}.json`;
+                  a.download = `interview-results-${Date.now()}.json`;
                   a.click();
                 }}
                 className="flex-1 px-4 py-2 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white rounded-lg transition-all font-medium"
