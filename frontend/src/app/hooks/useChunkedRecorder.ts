@@ -27,6 +27,7 @@ export function useChunkedRecorder({ onChunkReady, onError }: ChunkedRecorderOpt
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [chunkCount, setChunkCount] = useState(0);
+  const [pendingUploads, setPendingUploads] = useState(0);
   const [permissionGranted, setPermissionGranted] = useState(false);
   const [permissionError, setPermissionError] = useState<string | null>(null);
 
@@ -88,6 +89,7 @@ export function useChunkedRecorder({ onChunkReady, onError }: ChunkedRecorderOpt
 
         const idx = chunkIndexRef.current++;
         setChunkCount(idx + 1);
+        setPendingUploads((p) => p + 1); // count in-flight uploads
 
         const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
         const filename = `chunk_${String(idx).padStart(4, '0')}.${ext}`;
@@ -100,9 +102,11 @@ export function useChunkedRecorder({ onChunkReady, onError }: ChunkedRecorderOpt
           if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
           const json = await res.json();
           console.log(`[ChunkedRecorder] Chunk ${idx} uploaded → ${json.video_path}`);
+          setPendingUploads((p) => p - 1);
           onChunkReady(json.video_path, `chunk_${idx}`, idx);
         } catch (err: any) {
           console.error(`[ChunkedRecorder] Chunk ${idx} upload failed:`, err);
+          setPendingUploads((p) => p - 1);
           onError?.(`Chunk ${idx} upload failed: ${err.message}`);
         }
       };
@@ -179,6 +183,7 @@ export function useChunkedRecorder({ onChunkReady, onError }: ChunkedRecorderOpt
     stream,
     isRecording,
     chunkCount,
+    pendingUploads,
     permissionGranted,
     permissionError,
     requestPermissions,

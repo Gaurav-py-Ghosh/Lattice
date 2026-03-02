@@ -33,8 +33,6 @@ export interface VoiceAnalysis {
   score: number | null;
   window_times: number[];
   window_scores: number[];
-  energy: number[];
-  pitch_proxy: number[];
   error: string | null;
 }
 
@@ -164,13 +162,23 @@ export function useVisionSession() {
 
           case 'chunk_processed': {
             _clearChunkTimeout(message.chunk_id);
+            // Strip bulky arrays (energy, pitch_proxy) from voice_analysis before storing
+            const rawVoice = message.voice_analysis;
+            const voice_analysis: VoiceAnalysis | null = rawVoice
+              ? {
+                  score: rawVoice.score ?? null,
+                  window_times: rawVoice.window_times ?? [],
+                  window_scores: rawVoice.window_scores ?? [],
+                  error: rawVoice.error ?? null,
+                }
+              : null;
             const result: ChunkResult = {
               chunkId: message.chunk_id,
               chunkIndex: message.chunk_index ?? 0,
               gaze_data: message.gaze_data || [],
               predictions: message.predictions || [],
               inference_summary: message.inference_summary || null,
-              voice_analysis: message.voice_analysis || null,
+              voice_analysis,
               facial_analysis: message.facial_analysis || null,
               receivedAt: new Date().toISOString(),
             };

@@ -59,6 +59,7 @@ export default function InterviewRoom() {
     stream: cameraStream,
     isRecording: isChunkRecording,
     chunkCount,
+    pendingUploads,
     permissionGranted,
     permissionError,
     requestPermissions,
@@ -590,7 +591,7 @@ export default function InterviewRoom() {
                     </p>
                     <p className="text-sm text-gray-400">
                       {chunkResults.length > 0
-                        ? `${chunkResults.length} chunk${chunkResults.length !== 1 ? 's' : ''} analyzed.${pendingChunks > 0 ? ` ${pendingChunks} processing…` : ''}`
+                        ? `${chunkResults.length} chunk${chunkResults.length !== 1 ? 's' : ''} analyzed.${pendingUploads > 0 ? ` ${pendingUploads} uploading…` : ''}${pendingChunks > 0 ? ` ${pendingChunks} processing…` : ''}`
                         : isChunkRecording
                         ? 'Recording in progress. First AI scores appear after 15 seconds.'
                         : 'Complete calibration to begin recording and AI analysis.'}
@@ -657,6 +658,11 @@ export default function InterviewRoom() {
               <h2 className="text-2xl font-bold text-white mb-2">📊 Interview Results</h2>
               <p className="text-gray-400 text-sm">
                 {chunkResults.length} chunk{chunkResults.length !== 1 ? 's' : ''} analyzed
+                {pendingUploads > 0 && (
+                  <span className="ml-2 text-blue-400 animate-pulse">
+                    · {pendingUploads} uploading…
+                  </span>
+                )}
                 {pendingChunks > 0 && (
                   <span className="ml-2 text-yellow-400 animate-pulse">
                     · {pendingChunks} still processing…
@@ -779,10 +785,20 @@ export default function InterviewRoom() {
                 Close & Go Home
               </button>
               <button
-                disabled={pendingChunks > 0}
+                disabled={pendingChunks > 0 || pendingUploads > 0}
                 onClick={() => {
+                  // Aggregate inference_summary across all chunks
+                  const allConf = chunkResults.flatMap((c) => c.predictions.map((p) => p.confidence));
+                  const overall_inference_summary = allConf.length > 0
+                    ? {
+                        count: allConf.length,
+                        mean_confidence: parseFloat((allConf.reduce((s, v) => s + v, 0) / allConf.length).toFixed(4)),
+                        min_confidence:  parseFloat(Math.min(...allConf).toFixed(4)),
+                        max_confidence:  parseFloat(Math.max(...allConf).toFixed(4)),
+                      }
+                    : null;
                   const blob = new Blob(
-                    [JSON.stringify({ chunkResults, sessionData }, null, 2)],
+                    [JSON.stringify({ chunkResults, overall_inference_summary, sessionData }, null, 2)],
                     { type: 'application/json' }
                   );
                   const url = URL.createObjectURL(blob);
@@ -792,9 +808,11 @@ export default function InterviewRoom() {
                   a.click();
                 }}
                 className="flex-1 px-4 py-2 bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 text-white rounded-lg transition-all font-medium disabled:opacity-40 disabled:cursor-not-allowed disabled:from-purple-500/50 disabled:to-pink-500/50"
-                title={pendingChunks > 0 ? `Waiting for ${pendingChunks} chunk${pendingChunks !== 1 ? 's' : ''} to finish…` : 'Download all results'}
+                title={pendingChunks > 0 || pendingUploads > 0 ? `Waiting for ${pendingUploads} upload${pendingUploads !== 1 ? 's' : ''} + ${pendingChunks} chunk${pendingChunks !== 1 ? 's' : ''} to finish…` : 'Download all results'}
               >
-                {pendingChunks > 0
+                {pendingUploads > 0
+                  ? `Uploading ${pendingUploads} chunk${pendingUploads !== 1 ? 's' : ''}…`
+                  : pendingChunks > 0
                   ? `Waiting for ${pendingChunks} chunk${pendingChunks !== 1 ? 's' : ''}…`
                   : 'Download Data'}
               </button>
