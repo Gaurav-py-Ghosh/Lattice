@@ -1221,10 +1221,11 @@ while cap.isOpened():
         print(f"[Mouse Control] {'Enabled' if mouse_control_enabled else 'Disabled'}")
         time.sleep(0.3)  # debounce to prevent rapid toggling
 
-    # Auto-calibration after 3 seconds
+    # Auto-calibration: 0.5 s for prerecorded video, 3 s for live webcam
+    _calib_wait = 0.5 if args.video else 3.0
     if not auto_calibrated and not (left_sphere_locked and right_sphere_locked):
         elapsed_time = virtual_time - auto_calibration_start_time
-        if elapsed_time >= 3.0:  # Wait 3 seconds (virtual) before auto-calibrating
+        if elapsed_time >= _calib_wait:  # Wait before auto-calibrating
             current_nose_scale = compute_scale(nose_points_3d)
             # Lock LEFT eye
             left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)

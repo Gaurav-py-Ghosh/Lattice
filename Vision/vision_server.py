@@ -28,12 +28,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 import soundfile as sf
 import torch
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from transformers import AutoImageProcessor
 
 # ---------------------------------------------------------------------------
 # Voice module path — add Voice_Evaluation_PRJ3 to sys.path so we can import
@@ -222,19 +224,149 @@ class VoiceAnalyzer:
 voice_analyzer = VoiceAnalyzer()
 
 # ---------------------------------------------------------------------------
-# FastAPI lifespan — eager-load the voice model once at startup
+# VideoInferenceAnalyzer — in-process VideoMAE confidence model
+# ---------------------------------------------------------------------------
+
+_ATEMPT2_ROOT = Path(__file__).parent.parent / "Atempt2"
+if str(_ATEMPT2_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ATEMPT2_ROOT))
+
+VIDEO_MODEL_PATH = str(_ATEMPT2_ROOT / "checkpoints" / "videoMAE_confidence_ranker_epoch6.pth")
+FACIAL_MODEL_PATH = str(_ATEMPT2_ROOT / "checkpoints" / "best_facial_expression_model.pth")
+VIDEO_NUM_FRAMES = 16
+
+try:
+    from src.model.video_model import VideoModel as _VideoModel
+    _VIDEO_MODEL_CLASS_AVAILABLE = True
+except ImportError as _ve:
+    _VIDEO_MODEL_CLASS_AVAILABLE = False
+    print(f"[VideoAnalyzer] WARNING: could not import VideoModel: {_ve}")
+
+
+class _BaseVideoAnalyzer:
+    """Shared logic for in-process VideoMAE-based analyzers."""
+
+    def __init__(self, label: str, model_path: str):
+        self._label = label
+        self._model_path = model_path
+        self._model = None
+        self._processor = None
+        self._device = None
+        self._lock = threading.Lock()
+
+    def load(self):
+        if self._model is not None:
+            return True
+        with self._lock:
+            if self._model is not None:
+                return True
+            if not _VIDEO_MODEL_CLASS_AVAILABLE:
+                print(f"[{self._label}] VideoModel class unavailable — skipping load")
+                return False
+            if not os.path.exists(self._model_path):
+                print(f"[{self._label}] Model file not found: {self._model_path}")
+                return False
+            try:
+                self._device = "cuda" if torch.cuda.is_available() else "cpu"
+                print(f"[{self._label}] Loading model on {self._device}…")
+                self._processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
+                self._model = _VideoModel().to(self._device)
+                ckpt = torch.load(self._model_path, map_location=self._device, weights_only=False)
+                state = ckpt.get("model_state_dict", ckpt)
+                self._model.load_state_dict(state)
+                self._model.eval()
+                print(f"[{self._label}] Model ready on {self._device}")
+                return True
+            except Exception as e:
+                print(f"[{self._label}] ERROR loading model: {e}")
+                return False
+
+    def _extract_frames(self, video_path: str, num_frames: int = VIDEO_NUM_FRAMES) -> np.ndarray:
+        cap = cv2.VideoCapture(video_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total == 0:
+            cap.release()
+            raise ValueError(f"Video has 0 frames: {video_path}")
+        indices = np.linspace(0, total - 1, num_frames, dtype=int)
+        frames = []
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ret, frame = cap.read()
+            if ret:
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
+        if len(frames) == 0:
+            raise ValueError(f"Could not read any frames from: {video_path}")
+        # Pad if short
+        while len(frames) < num_frames:
+            frames.append(frames[-1])
+        return np.array(frames[:num_frames])
+
+    def _run_inference(self, video_path: str) -> float:
+        frames = self._extract_frames(video_path)
+        frames_list = [frame for frame in frames]
+        inputs = self._processor(frames_list, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(self._device)
+        with torch.no_grad():
+            output = self._model(pixel_values)
+        return float(output.item())
+
+    def analyze(self, video_path: str, session_id: str = "tmp") -> dict:
+        if not self.load():
+            return {"score": None, "error": f"{self._label} model not available"}
+        try:
+            score = self._run_inference(video_path)
+            return {"score": round(score, 4), "error": None}
+        except Exception as e:
+            print(f"[{self._label}] ERROR: {e}")
+            return {"score": None, "error": str(e)}
+
+
+class VideoInferenceAnalyzer(_BaseVideoAnalyzer):
+    def __init__(self):
+        super().__init__("VideoMAE", VIDEO_MODEL_PATH)
+
+
+class FacialExpressionAnalyzer(_BaseVideoAnalyzer):
+    def __init__(self):
+        super().__init__("FacialExpression", FACIAL_MODEL_PATH)
+
+
+video_inference_analyzer = VideoInferenceAnalyzer()
+facial_expression_analyzer = FacialExpressionAnalyzer()
+
+# ---------------------------------------------------------------------------
+# FastAPI lifespan — eager-load all three models once at startup
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
-    """Load the voice model in a thread-pool worker at startup so the event
-    loop isn't blocked while torch initialises transformers weights."""
+    """Load all ML models in thread-pool workers at startup."""
+    global CHUNK_SEMAPHORE
+    CHUNK_SEMAPHORE = asyncio.Semaphore(3)
     loop = asyncio.get_event_loop()
-    print("[Startup] Pre-loading VoiceAnalyzer model…")
-    await loop.run_in_executor(None, voice_analyzer.load)
-    print("[Startup] VoiceAnalyzer ready.")
+    print("[Startup] Pre-loading all models…")
+    await asyncio.gather(
+        loop.run_in_executor(None, voice_analyzer.load),
+        loop.run_in_executor(None, video_inference_analyzer.load),
+        loop.run_in_executor(None, facial_expression_analyzer.load),
+    )
+    print("[Startup] All models ready.")
+    # Check ffmpeg availability (required for voice analysis audio extraction)
+    _ffmpeg_exe = os.environ.get("FFMPEG_PATH", "ffmpeg")
+    try:
+        subprocess.run(
+            [_ffmpeg_exe, "-version"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+        )
+        print(f"[Startup] ffmpeg OK ({_ffmpeg_exe})")
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print(
+            f"[Startup] WARNING: ffmpeg not found at '{_ffmpeg_exe}'. "
+            "Voice analysis will fail for video chunks. "
+            "Install ffmpeg, add it to PATH, or set FFMPEG_PATH env variable."
+        )
     yield  # server runs here
-    # (cleanup on shutdown goes after yield if needed)
 
 # Create app here so we can pass lifespan
 app = FastAPI(lifespan=lifespan)
@@ -252,6 +384,10 @@ app.add_middleware(
 # Store active sessions
 # ---------------------------------------------------------------------------
 active_sessions = {}
+
+# Max concurrent chunk-processing tasks (each spawns a vision.py subprocess).
+# Initialised in lifespan so it's bound to the correct event loop.
+CHUNK_SEMAPHORE: asyncio.Semaphore  # forward declaration; assigned in lifespan
 
 
 class VisionSession:
@@ -325,14 +461,14 @@ class VisionSession:
         
         # Start vision.py with output logging
         try:
-            vision_log_file = open(self.vision_log, 'w', encoding='utf-8')
+            self._vision_log_file = open(self.vision_log, 'w', encoding='utf-8')
             # PYTHONIOENCODING ensures emoji/unicode in vision.py print() go to the log cleanly
             child_env = {**os.environ, 'PYTHONIOENCODING': 'utf-8'}
             if os.name == 'nt':  # Windows
                 self.vision_process = subprocess.Popen(
                     vision_cmd,
                     cwd=Path(__file__).parent,
-                    stdout=vision_log_file,
+                    stdout=self._vision_log_file,
                     stderr=subprocess.STDOUT,
                     env=child_env,
                     creationflags=subprocess.CREATE_NO_WINDOW
@@ -341,7 +477,7 @@ class VisionSession:
                 self.vision_process = subprocess.Popen(
                     vision_cmd,
                     cwd=Path(__file__).parent,
-                    stdout=vision_log_file,
+                    stdout=self._vision_log_file,
                     stderr=subprocess.STDOUT,
                     env=child_env,
                 )
@@ -351,33 +487,6 @@ class VisionSession:
             print(f"ERROR: starting vision.py: {e}")
             self.is_running = False
             return
-        
-        # Give vision.py a moment to start before launching inference
-        time.sleep(2)
-        
-        # Start realtime_inference.py with output logging
-        try:
-            inference_log_file = open(self.inference_log, 'w', encoding='utf-8')
-            if os.name == 'nt':  # Windows
-                self.inference_process = subprocess.Popen(
-                    inference_cmd,
-                    cwd=Path(__file__).parent,
-                    stdout=inference_log_file,
-                    stderr=subprocess.STDOUT,
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-            else:  # Linux/Mac
-                self.inference_process = subprocess.Popen(
-                    inference_cmd,
-                    cwd=Path(__file__).parent,
-                    stdout=inference_log_file,
-                    stderr=subprocess.STDOUT,
-                )
-            print(f"Started realtime_inference.py (PID: {self.inference_process.pid})")
-            print(f"   Output log: {self.inference_log}")
-        except Exception as e:
-            print(f"ERROR: starting inference: {e}")
-            # Continue anyway, vision still works without inference
         
         self.is_running = True
         
@@ -390,7 +499,6 @@ class VisionSession:
         
         print(f"Session started: {self.session_id}")
         print(f"   Log file: {self.log_file_path}")
-        print(f"   Predictions file: {self.predictions_file}")
         
     def stop(self):
         """Stop vision.py and realtime_inference.py subprocesses gracefully"""
@@ -404,6 +512,14 @@ class VisionSession:
                 # Force kill if doesn't terminate
                 self.vision_process.kill()
                 self.vision_process.wait()
+            finally:
+                # Close the stdout log file handle to prevent leaking the fd
+                if getattr(self, '_vision_log_file', None):
+                    try:
+                        self._vision_log_file.close()
+                    except Exception:
+                        pass
+                    self._vision_log_file = None
             
             print(f"Stopped vision.py")
         
@@ -488,95 +604,154 @@ async def _process_chunk(
 ) -> None:
     """Process a single 15-s video chunk through all three analysis modules:
 
-    1. vision.py          — gaze tracking (subprocess, exits at EOF)
-    2. realtime_inference — VideoMAE confidence (subprocess, coupled to vision.py)
-    3. voice_analyzer     — speaking skills (in-process, runs concurrently)
+    1. vision.py              — gaze tracking (subprocess, exits at EOF)
+    2. video_inference_analyzer — VideoMAE confidence (in-process)
+    3. facial_expression_analyzer — facial expression score (in-process)
+    4. voice_analyzer         — speaking skills (in-process)
 
-    Results are sent back as a 'chunk_processed' WebSocket message.
+    All three ML models run concurrently once vision.py exits.
+    Semaphore limits to CHUNK_SEMAPHORE concurrent chunks.
+    Files are cleaned up in the finally block.
     """
     loop = asyncio.get_event_loop()
 
-    # ---- Create a mini VisionSession for this chunk ----
-    session = VisionSession(chunk_id, video_path=video_path)
-    session.start()
+    async with CHUNK_SEMAPHORE:
+        # ---- Create a mini VisionSession for gaze tracking only ----
+        session = VisionSession(chunk_id, video_path=video_path)
 
-    if not session.is_running:
+        # Run session.start() in executor — it contains time.sleep() calls
+        # that would otherwise block the event loop
+        await loop.run_in_executor(None, session.start)
+
+        if not session.is_running:
+            try:
+                await websocket.send_json({
+                    'type': 'chunk_error',
+                    'chunk_id': chunk_id,
+                    'chunk_index': chunk_index,
+                    'message': f'Failed to start gaze session for chunk {chunk_id}',
+                })
+            except Exception:
+                pass
+            # Clean up the uploaded video even on early failure
+            try:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+            except Exception:
+                pass
+            return
+
         try:
-            await websocket.send_json({
-                'type': 'chunk_error',
-                'chunk_id': chunk_id,
-                'chunk_index': chunk_index,
-                'message': f'Failed to start vision session for chunk {chunk_id}',
-            })
-        except Exception:
-            pass
-        return
+            # ---- Wait for vision.py to finish (it exits at EOF) ----
+            await loop.run_in_executor(None, session.vision_process.wait)
+            print(f"[Chunk {chunk_index}] vision.py finished (PID {session.vision_process.pid})")
 
-    try:
-        # ---- Wait for vision.py to finish processing the video (EOF) ----
-        # Run in executor so we don't block the event loop
-        await loop.run_in_executor(None, session.vision_process.wait)
-        print(f"[Chunk {chunk_index}] vision.py finished (PID {session.vision_process.pid})")
+            # ---- Run all three ML analyses concurrently ----
+            voice_task = loop.run_in_executor(
+                None, voice_analyzer.analyze, video_path, chunk_id
+            )
+            video_task = loop.run_in_executor(
+                None, video_inference_analyzer.analyze, video_path, chunk_id
+            )
+            facial_task = loop.run_in_executor(
+                None, facial_expression_analyzer.analyze, video_path, chunk_id
+            )
 
-        # Give realtime_inference a moment to process the chunks vision.py wrote
-        await asyncio.sleep(3)
+            gaze_data = session.get_log_data()
 
-        # ---- Run voice analysis concurrently while inference settles ----
-        voice_task = loop.run_in_executor(
-            None, voice_analyzer.analyze, video_path, chunk_id
-        )
+            # Compute gaze summary stats from raw log entries
+            gaze_counts = {"Looking Forward": 0, "Looking Left": 0,
+                           "Looking Right": 0, "Looking Away": 0}
+            for entry in gaze_data:
+                s = entry.get("status", "")
+                if s in gaze_counts:
+                    gaze_counts[s] += 1
+            gaze_total = sum(gaze_counts.values()) or 1  # avoid div-by-zero
+            gaze_summary = {
+                "total_frames": gaze_total,
+                "looking_forward": gaze_counts["Looking Forward"],
+                "looking_left":    gaze_counts["Looking Left"],
+                "looking_right":   gaze_counts["Looking Right"],
+                "looking_away":    gaze_counts["Looking Away"],
+                "looking_forward_pct": round(gaze_counts["Looking Forward"] / gaze_total * 100, 1),
+                "looking_left_pct":    round(gaze_counts["Looking Left"]    / gaze_total * 100, 1),
+                "looking_right_pct":   round(gaze_counts["Looking Right"]   / gaze_total * 100, 1),
+                "looking_away_pct":    round(gaze_counts["Looking Away"]    / gaze_total * 100, 1),
+            } if gaze_data else {}
 
-        # ---- Stop inference process (vision.py already done, give it 3 s then kill) ----
-        def _stop_inference():
-            proc = session.inference_process
-            if proc and proc.poll() is None:  # still running
+            voice_result, video_result, facial_result = await asyncio.gather(
+                voice_task, video_task, facial_task
+            )
+
+            # Build a predictions list from the in-process VideoMAE result
+            # so the frontend's existing ChunkResult shape stays compatible
+            predictions = []
+            if video_result.get("score") is not None:
+                predictions = [{
+                    "chunk": chunk_index,
+                    "video_file": Path(video_path).name,
+                    "confidence": video_result["score"],
+                    "timestamp": time.time(),
+                    "processing_time": 0,
+                }]
+            inference_summary = {
+                "count": len(predictions),
+                "mean_confidence": video_result.get("score") or 0.0,
+                "min_confidence": video_result.get("score") or 0.0,
+                "max_confidence": video_result.get("score") or 0.0,
+            } if predictions else {}
+
+            print(
+                f"[Chunk {chunk_index}] Done: "
+                f"gaze={len(gaze_data)} (L={gaze_summary.get('looking_left',0)} R={gaze_summary.get('looking_right',0)} F={gaze_summary.get('looking_forward',0)}), "
+                f"confidence={video_result.get('score')}, "
+                f"facial={facial_result.get('score')}, "
+                f"voice={voice_result.get('score')}"
+            )
+
+            try:
+                await websocket.send_json({
+                    'type': 'chunk_processed',
+                    'chunk_id': chunk_id,
+                    'chunk_index': chunk_index,
+                    'gaze_data': gaze_data,
+                    'gaze_summary': gaze_summary,
+                    'predictions': predictions,
+                    'inference_summary': inference_summary,
+                    'voice_analysis': voice_result,
+                    'facial_analysis': facial_result,
+                })
+            except Exception:
+                print(f"[Chunk {chunk_index}] Client disconnected — results discarded")
+
+        except Exception as e:
+            print(f"[Chunk {chunk_index}] ERROR: {e}")
+            try:
+                await websocket.send_json({
+                    'type': 'chunk_error',
+                    'chunk_id': chunk_id,
+                    'chunk_index': chunk_index,
+                    'message': str(e),
+                })
+            except Exception:
+                print(f"[Chunk {chunk_index}] Could not send chunk_error — client disconnected")
+        finally:
+            session.stop()
+            # ---- Clean up all files produced by this chunk ----
+            files_to_delete = [
+                video_path,
+                str(session.log_file_path),
+                str(session.vision_log),
+                str(session.inference_log),
+                str(session.predictions_file),
+                str(Path(video_path).parent / f"voice_tmp_{chunk_id}.wav"),
+            ]
+            for fpath in files_to_delete:
                 try:
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-
-        await loop.run_in_executor(None, _stop_inference)
-
-        # ---- Collect results ----
-        gaze_data = session.get_log_data()
-        pred_data = session.get_predictions()
-        voice_result = await voice_task
-
-        print(
-            f"[Chunk {chunk_index}] Done: "
-            f"gaze={len(gaze_data)}, "
-            f"preds={len(pred_data.get('predictions', []))}, "
-            f"voice={voice_result.get('score')}"
-        )
-
-        try:
-            await websocket.send_json({
-                'type': 'chunk_processed',
-                'chunk_id': chunk_id,
-                'chunk_index': chunk_index,
-                'gaze_data': gaze_data,
-                'predictions': pred_data.get('predictions', []),
-                'inference_summary': pred_data.get('summary', {}),
-                'voice_analysis': voice_result,
-            })
-        except Exception:
-            print(f"[Chunk {chunk_index}] Client already disconnected — results discarded")
-
-    except Exception as e:
-        print(f"[Chunk {chunk_index}] ERROR: {e}")
-        try:
-            await websocket.send_json({
-                'type': 'chunk_error',
-                'chunk_id': chunk_id,
-                'chunk_index': chunk_index,
-                'message': str(e),
-            })
-        except Exception:
-            print(f"[Chunk {chunk_index}] Could not send chunk_error — client disconnected")
-    finally:
-        session.stop()
+                    if os.path.exists(fpath):
+                        os.remove(fpath)
+                except Exception:
+                    pass
 
 
 @app.websocket("/ws")
@@ -640,8 +815,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 speed = float(message.get('speed', 1.0))
                 session = VisionSession(session_id,
                                         video_path=video_path, loop=loop, speed=speed)
-                session.start()
-                
+                # Run in executor — start() contains time.sleep() that would block the event loop
+                await asyncio.get_event_loop().run_in_executor(None, session.start)
+
                 active_sessions[session_id] = session
                 current_session = session
                 
