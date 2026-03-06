@@ -7,6 +7,7 @@ in parallel with recording. Outputs confidence predictions for streaming to fron
 
 import sys
 import os
+import math
 from pathlib import Path
 import argparse
 import time
@@ -203,6 +204,89 @@ class RealtimeVideoInference:
             print(f"ERROR: Error processing chunk {chunk_num}: {e}", flush=True)
             return None
     
+    def process_video_file(self, video_path: Path, chunk_duration: float = 15.0):
+        """Split a video into N-second chunks and run inference on each chunk offline."""
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+        if fps <= 0:
+            fps = 30.0
+
+        frames_per_chunk = int(fps * chunk_duration)
+        num_chunks = max(1, math.ceil(total_frames / frames_per_chunk))
+        duration_total = total_frames / fps
+
+        print(f"\nVideo   : {video_path.name}")
+        print(f"FPS     : {fps:.1f}  |  Total frames: {total_frames}  |  Duration: {duration_total:.1f}s")
+        print(f"Chunk   : {chunk_duration}s = {frames_per_chunk} frames  |  Chunks: {num_chunks}\n")
+
+        for chunk_idx in range(num_chunks):
+            start_frame = chunk_idx * frames_per_chunk
+            end_frame   = min(start_frame + frames_per_chunk, total_frames)
+            frames_in_chunk = end_frame - start_frame
+
+            # Sample 16 frames uniformly from this chunk's frame range
+            num_frames = 16
+            local_indices = np.linspace(0, frames_in_chunk - 1, num_frames, dtype=int)
+
+            cap = cv2.VideoCapture(str(video_path))
+            frames = []
+            for local_idx in local_indices:
+                abs_idx = start_frame + int(local_idx)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, abs_idx)
+                ret, frame = cap.read()
+                if ret:
+                    frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            cap.release()
+
+            if len(frames) < num_frames:
+                print(f"  Chunk {chunk_idx}: only {len(frames)} frames read, skipping", flush=True)
+                continue
+
+            t_start = start_frame / fps
+            t_end   = end_frame   / fps
+            print(f"Chunk {chunk_idx + 1}/{num_chunks}  [{t_start:.1f}s – {t_end:.1f}s]", flush=True)
+            proc_start = time.time()
+
+            try:
+                frames_arr   = np.array(frames[:num_frames])
+                video_tensor = self.preprocess_frames(frames_arr)
+
+                with torch.no_grad():
+                    with autocast(enabled=self.device.type == 'cuda'):
+                        output = self.model(video_tensor)
+                confidence = output.item()
+                elapsed = time.time() - proc_start
+
+                prediction = {
+                    'chunk':           chunk_idx,
+                    'video_file':      video_path.name,
+                    'start_time':      round(t_start, 3),
+                    'end_time':        round(t_end, 3),
+                    'confidence':      float(confidence),
+                    'timestamp':       time.time(),
+                    'processing_time': round(elapsed, 3),
+                }
+                self.predictions.append(prediction)
+                self.processed_chunks.add(chunk_idx)
+
+                print(f"   confidence: {confidence:.4f}  (processed in {elapsed:.2f}s)", flush=True)
+                self.save_predictions()
+
+            except Exception as e:
+                print(f"   ERROR on chunk {chunk_idx}: {e}", flush=True)
+
+        print(f"\nFinished: {video_path.name}")
+        if self.predictions:
+            confs = [p['confidence'] for p in self.predictions]
+            print(f"  Chunks : {len(confs)}")
+            print(f"  Mean   : {np.mean(confs):.4f}")
+            print(f"  Min    : {np.min(confs):.4f}")
+            print(f"  Max    : {np.max(confs):.4f}")
+        print(f"  Output : {self.predictions_file}\n")
+
     def monitor_directory(self, data_dir: Path, check_interval: float = 2.0):
         """Monitor directory for new video chunks and process them"""
         print(f"\nMonitoring: {data_dir}", flush=True)
@@ -270,7 +354,11 @@ def main():
                         help='Directory for prediction outputs')
     parser.add_argument('--check-interval', type=float, default=2.0,
                         help='Seconds between directory checks')
-    
+    parser.add_argument('--video', type=str, default=None,
+                        help='Path to a video file to process offline in chunks')
+    parser.add_argument('--chunk-duration', type=float, default=15.0,
+                        help='Chunk duration in seconds for offline mode (default: 15.0)')
+
     args = parser.parse_args()
     
     print("=" * 70)
@@ -294,8 +382,16 @@ def main():
             output_dir=output_dir
         )
         
-        # Start monitoring
-        engine.monitor_directory(data_dir, check_interval=args.check_interval)
+        # Offline mode: process a video file directly
+        if args.video:
+            video_path = Path(args.video)
+            if not video_path.exists():
+                print(f"ERROR: Video not found: {video_path}")
+                sys.exit(1)
+            engine.process_video_file(video_path, chunk_duration=args.chunk_duration)
+        else:
+            # Start monitoring
+            engine.monitor_directory(data_dir, check_interval=args.check_interval)
         
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
