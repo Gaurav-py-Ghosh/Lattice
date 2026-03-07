@@ -1,4 +1,4 @@
-import cv2
+﻿import cv2
 import numpy as np
 import os
 import mediapipe as mp
@@ -22,24 +22,29 @@ if platform.system() == 'Windows':
     import ctypes.wintypes
 
 # Parse command line arguments
-parser = argparse.ArgumentParser(description='Vision Gaze Tracking')
-parser.add_argument('--session-id', type=str, default='default', help='Session ID for log file')
-parser.add_argument('--headless', action='store_true', help='Run without displaying OpenCV windows')
-parser.add_argument('--video', type=str, default=None,
-                    help='Path to input video file (if omitted, webcam is used)')
-parser.add_argument('--loop', action='store_true',
-                    help='Loop video when it ends')
-parser.add_argument('--speed', type=float, default=1.0,
-                    help='Playback speed multiplier (0.5 = slow, 2.0 = fast)')
-args = parser.parse_args()
+# When imported as a module, parse_args([]) uses all default values so the
+# import does not crash.  _run_interactive() is the only caller in __main__ mode.
+_parser = argparse.ArgumentParser(description='Vision Gaze Tracking')
+_parser.add_argument('--session-id', type=str, default='default', help='Session ID for log file')
+_parser.add_argument('--headless', action='store_true', help='Run without displaying OpenCV windows')
+_parser.add_argument('--video', type=str, default=None,
+                     help='Path to input video file (if omitted, webcam is used)')
+_parser.add_argument('--loop', action='store_true',
+                     help='Loop video when it ends')
+_parser.add_argument('--speed', type=float, default=1.0,
+                     help='Playback speed multiplier (0.5 = slow, 2.0 = fast)')
+args = _parser.parse_args([] if __name__ != '__main__' else None)
 
-# Headless mode flag
-HEADLESS_MODE = args.headless
-if HEADLESS_MODE:
-    print('[HEADLESS] Running in HEADLESS mode - OpenCV windows disabled')
+# Headless mode — defaults to True so importing the module is safe on headless servers.
+# _run_interactive() overrides this from args.
+HEADLESS_MODE = True
 
 # Screen and mouse control setup (from old script)
-MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
+# Wrapped in try/except so the module can be imported on headless servers.
+try:
+    MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
+except Exception:
+    MONITOR_WIDTH, MONITOR_HEIGHT = 1920, 1080
 CENTER_X = MONITOR_WIDTH // 2
 CENTER_Y = MONITOR_HEIGHT // 2
 mouse_control_enabled = False
@@ -92,32 +97,10 @@ R_ref_nose = [None]
 R_ref_forehead = [None]
 calibration_nose_scale = None
 
-# Initialize MediaPipe FaceMesh
+# MediaPipe module alias — FaceMesh is instantiated inside _run_interactive() / analyze_video()
 mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-
-# === Open video source (webcam or file) ===
-if args.video:
-    if not os.path.exists(args.video):
-        raise FileNotFoundError(f"Video file not found: {args.video}")
-    cap = cv2.VideoCapture(args.video)
-    print(f"[Video Mode] Using file: {args.video}", flush=True)
-else:
-    cap = cv2.VideoCapture(0)
-    print("[Camera Mode] Using live webcam", flush=True)
-w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-# Create named windows that we can control (only if not headless)
-if not HEADLESS_MODE:
-    cv2.namedWindow("Integrated Eye Tracking", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("Head/Eye Debug", cv2.WINDOW_NORMAL)
+# w, h (frame dimensions) are set as locals inside _run_interactive() and analyze_video().
+# Functions that need them accept w_frame / h_frame keyword arguments (see compute_and_draw_coordinate_box).
 
 # Windows minimization function
 def minimize_cv2_windows():
@@ -418,10 +401,21 @@ def draw_wireframe_cube(frame, center, R, size=80):
     for i, j in edges:
         cv2.line(frame, projected[i], projected[j], (255, 128, 0), 2)
 
-def compute_and_draw_coordinate_box(frame, face_landmarks, indices, ref_matrix_container, color=(0, 255, 0), size=80):
+def compute_and_draw_coordinate_box(frame, face_landmarks, indices, ref_matrix_container,
+                                    color=(0, 255, 0), size=80,
+                                    w_frame=None, h_frame=None):
+    """Compute PCA head-pose and draw debug geometry on *frame*.
+
+    w_frame / h_frame: frame pixel dimensions.  When called from interactive
+    mode they default to the module-level w/h; when called from analyze_video()
+    or any other importable context, pass the local capture dimensions.
+    """
+    _fw = w_frame if w_frame is not None else globals().get('w', 640)
+    _fh = h_frame if h_frame is not None else globals().get('h', 480)
+
     # Extract 3D positions of selected landmarks
     points_3d = np.array([
-        [face_landmarks[i].x * w, face_landmarks[i].y * h, face_landmarks[i].z * w]
+        [face_landmarks[i].x * _fw, face_landmarks[i].y * _fh, face_landmarks[i].z * _fw]
         for i in indices
     ])
 
@@ -430,7 +424,7 @@ def compute_and_draw_coordinate_box(frame, face_landmarks, indices, ref_matrix_c
 
     # Draw the raw 2D landmark points
     for i in indices:
-        x, y = int(face_landmarks[i].x * w), int(face_landmarks[i].y * h)
+        x, y = int(face_landmarks[i].x * _fw), int(face_landmarks[i].y * _fh)
         cv2.circle(frame, (x, y), 3, color, -1)
 
     # PCA-based orientation: Compute eigenvectors of the covariance matrix
@@ -827,405 +821,687 @@ def mouse_mover():
             pyautogui.moveTo(x, y)
         time.sleep(0.01)  # adjust for responsiveness
 
-# Start mouse movement thread
-threading.Thread(target=mouse_mover, daemon=True).start()
+# ===========================================================================
+# analyze_video — importable batch API
+# ===========================================================================
 
-# Eye sphere tracking variables (from new script)
-left_sphere_locked = False
-left_sphere_local_offset = None
-left_calibration_nose_scale = None
+def analyze_video(video_path: str, session_id: str = "default", speed: float = 1.0) -> list:
+    """Process a pre-recorded video and return gaze log entries.
 
-right_sphere_locked = False
-right_sphere_local_offset = None
-right_calibration_nose_scale = None
+    Fully self-contained and thread-safe: creates its own FaceMesh context
+    and all state is local.  Does not open any windows, start any threads,
+    or require pyautogui / sounddevice.
 
-# Auto-calibration state
-auto_calibrated = False
-auto_calibration_start_time = 0.0  # Virtual clock; counts from first frame
+    Includes the same eye-only deviation detection as the interactive script,
+    so 'Looking Away (Eyes Only)' entries appear alongside the four standard
+    head-based statuses.
 
-# Session-specific log file
-script_dir = os.path.dirname(__file__)
-data_dir = os.path.join(script_dir, "data")
-os.makedirs(data_dir, exist_ok=True)
-log_file_path = os.path.join(data_dir, f"gaze_log_{args.session_id}.txt")
-log_file = open(log_file_path, "w")  # 'w' mode to create new file for each session
-print(f"=" * 60, flush=True)
-print(f"Vision.py Starting - Session: {args.session_id}", flush=True)
-print(f"Logging gaze data to: {log_file_path}", flush=True)
-print(f"Headless mode: {HEADLESS_MODE}", flush=True)
-print(f"=" * 60, flush=True)
+    Returns:
+        list of {'timestamp': str, 'status': str}
+    """
+    if not os.path.exists(video_path):
+        print(f"[analyze_video] File not found: {video_path}", flush=True)
+        return []
 
-# === Recording Configuration ===
-RECORDING_INTERVAL = 15  # seconds per chunk
-AUDIO_SAMPLE_RATE = 44100  # 44.1kHz
-AUDIO_CHANNELS = 2  # Stereo
+    _cap = cv2.VideoCapture(video_path)
+    if not _cap.isOpened():
+        print(f"[analyze_video] Cannot open: {video_path}", flush=True)
+        return []
 
-# Recording state
-recording_enabled = True
-audio_recording_enabled = False  # Audio is optional
-current_chunk = 0
-chunk_start_time = 0.0  # Virtual clock; counts from first frame
-audio_queue = queue.Queue()
-video_writer = None
-audio_buffer = []
-audio_stream = None
+    _fps_v    = _cap.get(cv2.CAP_PROP_FPS) or 30.0
+    _frame_dt = 1.0 / _fps_v
+    _w        = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    _h        = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-def get_chunk_filename(chunk_num, extension):
-    """Generate filename for recording chunk"""
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join(data_dir, f"{args.session_id}_chunk{chunk_num:03d}_{timestamp}.{extension}")
+    # ── Local tracking state (mirrors _run_interactive) ──────────────────────
+    _gaze_dirs         = deque(maxlen=filter_length)
+    _R_ref_nose        = [None]
+    _virtual_time      = 0.0
+    _calib_wait        = 0.5   # seconds before auto-calibrate (video mode)
+    _BASE_RADIUS       = 20
+    _auto_calibrated   = False
+    _left_locked       = False
+    _right_locked      = False
+    _left_local_offset = None
+    _right_local_offset= None
+    _left_nose_scale   = None
+    _right_nose_scale  = None
+    _cal_yaw           = 0.0
+    _cal_pitch         = 0.0
+    _cal_eye_dir_l     = None  # calibrated left  eye direction in head frame
+    _cal_eye_dir_r     = None  # calibrated right eye direction in head frame
+    _eye_dirs_l        = deque(maxlen=filter_length)  # smoothed left  eye dirs
+    _eye_dirs_r        = deque(maxlen=filter_length)  # smoothed right eye dirs
+    _EYE_DEV_THRESHOLD = 12.0  # degrees total angular deviation (looser than interactive)
+    _needs_gaze_cal    = True   # compute yaw/pitch offsets on first valid post-calib frame
+    _log_entries       = []
 
-def audio_callback(indata, frames, time_info, status):
-    """Callback for audio recording - runs in separate thread"""
-    if status:
-        print(f"Audio callback status: {status}")
-    audio_queue.put(indata.copy())
+    # ── Log file ──────────────────────────────────────────────────────────────
+    _sdir     = os.path.dirname(os.path.abspath(__file__))
+    _data_dir = os.path.join(_sdir, "data")
+    os.makedirs(_data_dir, exist_ok=True)
+    _log_path = os.path.join(_data_dir, f"gaze_log_{session_id}.txt")
+    _log_file = None
 
-def save_audio_chunk(audio_data, chunk_num):
-    """Save accumulated audio data to file"""
-    if len(audio_data) == 0:
-        return
-    
-    audio_array = np.concatenate(audio_data, axis=0)
-    filename = get_chunk_filename(chunk_num, "wav")
-    
     try:
-        sf.write(filename, audio_array, AUDIO_SAMPLE_RATE)
-        print(f"💾 Saved audio chunk: {filename} ({len(audio_array)/AUDIO_SAMPLE_RATE:.1f}s)")
-    except Exception as e:
-        print(f"❌ Error saving audio: {e}")
+        _log_file = open(_log_path, "w", encoding="utf-8")
 
-def start_new_video_chunk(chunk_num, frame_width, frame_height, fps):
-    """Create new video writer for chunk"""
-    filename = get_chunk_filename(chunk_num, "mp4")
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(filename, fourcc, fps, (frame_width, frame_height))
-    
-    if not writer.isOpened():
-        print(f"ERROR: Could not open video writer for {filename}", flush=True)
-        return None
-    
-    print(f"Started video chunk: {filename}", flush=True)
-    return writer
+        with mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        ) as _face_mesh:
 
-# Disable audio capture when processing a video file (no live mic needed)
-if args.video:
-    audio_recording_enabled = False
-    recording_enabled = True   # video-only recording still OK
+            while _cap.isOpened():
+                _ret, _frame = _cap.read()
+                if not _ret:
+                    break
 
-# Start audio recording stream (optional - won't disable video if this fails)
-if recording_enabled and not args.video:
-    try:
-        audio_stream = sd.InputStream(
-            samplerate=AUDIO_SAMPLE_RATE,
-            channels=AUDIO_CHANNELS,
-            callback=audio_callback
-        )
-        audio_stream.start()
-        audio_recording_enabled = True
-        print(f"Audio recording started (Session: {args.session_id})", flush=True)
-        print(f"Recording chunks every {RECORDING_INTERVAL} seconds", flush=True)
-    except Exception as e:
-        print(f"WARNING: Audio recording disabled - {e}", flush=True)
-        print(f"Video-only recording will continue every {RECORDING_INTERVAL} seconds", flush=True)
-        audio_recording_enabled = False
-        # Keep recording_enabled = True for video
+                _virtual_time += _frame_dt * speed
 
-# Flag to track if windows have been minimized
-windows_minimized = False
+                _results = _face_mesh.process(cv2.cvtColor(_frame, cv2.COLOR_BGR2RGB))
+                if not _results.multi_face_landmarks:
+                    continue
 
-# Initialize video recording
-fps = cap.get(cv2.CAP_PROP_FPS)
-if fps is None or fps <= 1:
-    fps = 30.0
-fps = float(fps)
-frame_dt = 1.0 / fps
-if recording_enabled:
-    video_writer = start_new_video_chunk(current_chunk, w, h, fps)
+                _lm    = _results.multi_face_landmarks[0].landmark
+                _irl   = np.array([_lm[468].x * _w, _lm[468].y * _h, _lm[468].z * _w])
+                _irr   = np.array([_lm[473].x * _w, _lm[473].y * _h, _lm[473].z * _w])
 
-# Virtual clock: advances by frame_dt * speed per frame (deterministic for video files)
-virtual_time = 0.0
+                # Head pose — reuse existing function with local w/h
+                _hc, _R, _npts = compute_and_draw_coordinate_box(
+                    _frame, _lm, nose_indices, _R_ref_nose,
+                    color=(0, 255, 0), size=80,
+                    w_frame=_w, h_frame=_h,
+                )
+                _ns = compute_scale(_npts)
 
-while cap.isOpened():
-    ret, frame = cap.read()
+                # Auto-calibrate eye spheres once _calib_wait seconds have elapsed
+                if not _auto_calibrated and _virtual_time >= _calib_wait:
+                    _cam = _R.T @ np.array([0.0, 0.0, 1.0])
+                    _left_local_offset  = _R.T @ (_irl - _hc) + _BASE_RADIUS * _cam
+                    _left_nose_scale    = _ns
+                    _left_locked        = True
+                    _right_local_offset = _R.T @ (_irr - _hc) + _BASE_RADIUS * _cam
+                    _right_nose_scale   = _ns
+                    _right_locked       = True
+                    _auto_calibrated    = True
+                    print(f"[analyze_video:{session_id}] Auto-calibrated at {_virtual_time:.2f}s",
+                          flush=True)
 
-    if not ret:
-        if args.video and args.loop:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            virtual_time = 0.0
-            print("[Video] Looping video", flush=True)
-            continue
-        else:
-            print("[Video] End of file reached" if args.video else "[Camera] Stream ended", flush=True)
-            break
+                if not (_left_locked and _right_locked):
+                    continue
 
-    # Advance virtual clock each frame (deterministic; replaces time.time() in timing logic)
-    virtual_time += frame_dt * args.speed
+                # Eye sphere world positions (scale-compensated)
+                _sl  = _ns / _left_nose_scale  if _left_nose_scale  else 1.0
+                _sr  = _ns / _right_nose_scale if _right_nose_scale else 1.0
+                _spl = _hc + _R @ (_left_local_offset  * _sl)
+                _spr = _hc + _R @ (_right_local_offset * _sr)
 
-    # === Recording Management ===
-    if recording_enabled:
-        current_time = virtual_time
-        elapsed = current_time - chunk_start_time
-        
-        # Write current frame to video (frame.copy() avoids buffer-reuse issues
-        # when the source is a file-backed decoder)
-        if video_writer is not None:
-            video_writer.write(frame.copy())
-        
-        # Collect audio from queue (only if audio is enabled)
-        if audio_recording_enabled:
-            while not audio_queue.empty():
-                audio_buffer.append(audio_queue.get())
-        
-        # Check if it's time to save chunk and start new one
-        if elapsed >= RECORDING_INTERVAL:
-            print(f"\nChunk {current_chunk} complete ({elapsed:.1f}s)", flush=True)
-            
-            # Save and close current video
-            if video_writer is not None:
-                video_writer.release()
-                print(f"Saved video chunk {current_chunk}", flush=True)
-            
-            # Save audio (only if audio recording is enabled)
-            if audio_recording_enabled:
-                save_audio_chunk(audio_buffer, current_chunk)
-            
-            # Start new chunk
-            current_chunk += 1
-            chunk_start_time = current_time
-            audio_buffer = []
-            video_writer = start_new_video_chunk(current_chunk, w, h, fps)
+                # Per-eye gaze directions
+                _gl = _irl - _spl;  _gl /= (np.linalg.norm(_gl) or 1.0)
+                _gr = _irr - _spr;  _gr /= (np.linalg.norm(_gr) or 1.0)
+                _raw = (_gl + _gr) / 2;  _raw /= (np.linalg.norm(_raw) or 1.0)
+                _gaze_dirs.append(_raw)
 
-    combined_dir = None  # will be filled once you compute a smoothed direction
+                _avg = np.mean(_gaze_dirs, axis=0)
+                _avg /= (np.linalg.norm(_avg) or 1.0)
 
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(frame_rgb)
+                # Eye-in-head-frame vectors (needed for both calibration and eyes-only check)
+                _ll = _R.T @ _gl;  _ll /= (np.linalg.norm(_ll) or 1.0)
+                _rl = _R.T @ _gr;  _rl /= (np.linalg.norm(_rl) or 1.0)
+                _eye_dirs_l.append(_ll);  _eye_dirs_r.append(_rl)
+                # smooth — average and re-normalise
+                _ll_avg = np.mean(_eye_dirs_l, axis=0); _ll_avg /= (np.linalg.norm(_ll_avg) or 1.0)
+                _rl_avg = np.mean(_eye_dirs_r, axis=0); _rl_avg /= (np.linalg.norm(_rl_avg) or 1.0)
 
-    if results.multi_face_landmarks:
-        face_landmarks = results.multi_face_landmarks[0].landmark
-        gaze_status = "Detecting Gaze" # Initialize gaze_status
-    
-        # Index for left iris center point (from MediaPipe's iris model)
-        left_iris_idx = 468
-        right_iris_idx = 473
-        left_iris = face_landmarks[left_iris_idx]
-        right_iris = face_landmarks[right_iris_idx]
+                # First valid frame after sphere auto-calibration: capture direction offsets
+                # (mirrors what the user does in interactive mode: look at camera => record offset)
+                if _needs_gaze_cal:
+                    _, _, _ry, _rp, _ = convert_gaze_to_screen_coordinates(_avg, 0.0, 0.0)
+                    _cal_yaw      = -_ry
+                    _cal_pitch    = -_rp
+                    _cal_eye_dir_l = _ll_avg.copy()
+                    _cal_eye_dir_r = _rl_avg.copy()
+                    _needs_gaze_cal = False
+                    print(f"[analyze_video:{session_id}] Gaze direction calibrated: "
+                          f"yaw_off={_cal_yaw:.2f}° pitch_off={_cal_pitch:.2f}°",
+                          flush=True)
 
-        # Compute and draw stabilized coordinate frame from nose region
-        head_center, R_final, nose_points_3d = compute_and_draw_coordinate_box(
-            frame,
-            face_landmarks,
-            nose_indices,
-            R_ref_nose,
-            color=(0, 255, 0),
-            size=80
-        )
+                # Head-based gaze classification
+                _, _, _, _, _gaze_status = convert_gaze_to_screen_coordinates(
+                    _avg, _cal_yaw, _cal_pitch
+                )
 
-        # TODO compute this radius using canthus during calibration
-        base_radius = 20  # radius at calibration distance
+                # Eye-only deviation: angular distance from calibrated baseline vectors
+                # Using dot product avoids ±180° wrap-around issues with yaw/pitch decomposition
+                if _cal_eye_dir_l is not None:
+                    _dev_l = math.degrees(math.acos(np.clip(np.dot(_ll_avg, _cal_eye_dir_l), -1.0, 1.0)))
+                    _dev_r = math.degrees(math.acos(np.clip(np.dot(_rl_avg, _cal_eye_dir_r), -1.0, 1.0)))
+                    if (_dev_l + _dev_r) / 2 > _EYE_DEV_THRESHOLD:
+                        _gaze_status = "Looking Away (Eyes Only)"
 
-        x_iris_l = int(left_iris.x * w)
-        y_iris_l = int(left_iris.y * h)
-        # === LEFT EYE visualization ===
-        if not left_sphere_locked:
-            cv2.circle(frame, (x_iris_l, y_iris_l), 10, (255, 25, 25), 2)
-        else:
-            current_nose_scale = compute_scale(nose_points_3d)
-            scale_ratio = current_nose_scale / left_calibration_nose_scale if left_calibration_nose_scale else 1.0
-            scaled_offset = left_sphere_local_offset * scale_ratio
-            sphere_world_l = head_center + R_final @ scaled_offset
-            x_sphere_l, y_sphere_l = int(sphere_world_l[0]), int(sphere_world_l[1])
-            scaled_radius_l = int(base_radius * scale_ratio)
-            cv2.circle(frame, (x_sphere_l, y_sphere_l), scaled_radius_l, (255, 255, 25), 2)
+                _ts = datetime.datetime.now().isoformat()
+                _log_entries.append({"timestamp": _ts, "status": _gaze_status})
+                _log_file.write(f"{_ts}: {_gaze_status}\n")
+                _log_file.flush()
 
-        x_iris_r = int(right_iris.x * w)
-        y_iris_r = int(right_iris.y * h)
-        # === RIGHT EYE visualization ===
-        if not right_sphere_locked:
-            cv2.circle(frame, (x_iris_r, y_iris_r), 10, (25, 255, 25), 2)
-        else:
-            current_nose_scale = compute_scale(nose_points_3d)
-            scale_ratio_r = current_nose_scale / right_calibration_nose_scale if right_calibration_nose_scale else 1.0
-            scaled_offset_r = right_sphere_local_offset * scale_ratio_r
-            sphere_world_r = head_center + R_final @ scaled_offset_r
-            x_sphere_r, y_sphere_r = int(sphere_world_r[0]), int(sphere_world_r[1])
-            scaled_radius_r = int(base_radius * scale_ratio_r)
-            cv2.circle(frame, (x_sphere_r, y_sphere_r), scaled_radius_r, (25, 255, 255), 2)
+    except Exception as _exc:
+        print(f"[analyze_video:{session_id}] ERROR: {_exc}", flush=True)
+    finally:
+        _cap.release()
+        if _log_file is not None:
+            try:
+                _log_file.close()
+            except Exception:
+                pass
 
-        iris_3d_left = np.array([left_iris.x * w, left_iris.y * h, left_iris.z * w])
-        iris_3d_right = np.array([right_iris.x * w, right_iris.y * h, right_iris.z * w])
-        
-        if left_sphere_locked and right_sphere_locked:
-            # ==== DRAW LEFT AND RIGHT GAZE ====
-            draw_gaze(frame, sphere_world_l, iris_3d_left, scaled_radius_l, (55, 255, 0), 130)   
-            draw_gaze(frame, sphere_world_r, iris_3d_right, scaled_radius_r, (55, 255, 0), 130)  
+    print(f"[analyze_video:{session_id}] {len(_log_entries)} gaze entries", flush=True)
+    return _log_entries
 
-            # ==== COMPUTE COMBINED GAZE DIRECTION FOR SCREEN MAPPING ====
-            # Calculate individual gaze directions
-            left_gaze_dir = iris_3d_left - sphere_world_l
-            left_gaze_dir /= np.linalg.norm(left_gaze_dir)
-            
-            right_gaze_dir = iris_3d_right - sphere_world_r
-            right_gaze_dir /= np.linalg.norm(right_gaze_dir)
-            
-            # Combine gaze directions (average)
-            raw_combined_direction = (left_gaze_dir + right_gaze_dir) / 2
-            raw_combined_direction /= np.linalg.norm(raw_combined_direction)
 
-            # Update direction buffer for smoothing
-            combined_gaze_directions.append(raw_combined_direction)
+# ===========================================================================
+# _run_interactive — full interactive session (only when run as __main__)
+# ===========================================================================
 
-            # Smoothed direction
-            avg_combined_direction = np.mean(combined_gaze_directions, axis=0)
-            avg_combined_direction /= np.linalg.norm(avg_combined_direction)
+def _run_interactive(args):
+    """Full interactive gaze tracker with UI, keyboard controls, mouse, and chunked recording.
+    Called only when vision.py is run directly as a script."""
+    global HEADLESS_MODE, units_per_cm, debug_world_frozen, orbit_pivot_frozen, mouse_control_enabled
+    HEADLESS_MODE = args.headless
+    if HEADLESS_MODE:
+        print('[HEADLESS] Running in HEADLESS mode - OpenCV windows disabled')
 
-            combined_dir = avg_combined_direction
-
-            # ==== CONVERT GAZE TO SCREEN COORDINATES ====
-            screen_x, screen_y, raw_yaw, raw_pitch, gaze_status = convert_gaze_to_screen_coordinates(
-                avg_combined_direction, 
-                calibration_offset_yaw, 
-                calibration_offset_pitch
-            )
-            print(f"Gaze Status: {gaze_status}")
-
-            # Update mouse target
-            if mouse_control_enabled:
-                with mouse_lock:
-                    mouse_target[0] = screen_x
-                    mouse_target[1] = screen_y
-
-            # ===== NEW: Write screen position to file =====
-            write_screen_position(screen_x, screen_y)
-
-            # Draw combined gaze ray for visualization
-            combined_origin = (sphere_world_l + sphere_world_r) / 2
-            combined_target = combined_origin + avg_combined_direction * gaze_length
-            cv2.line(
-                frame,
-                (int(combined_origin[0]), int(combined_origin[1])),
-                (int(combined_target[0]), int(combined_target[1])),
-                (255, 255, 10), 3
-            )
-
-            # Center multiple lines of text
-            texts = [
-                f"Screen: ({screen_x}, {screen_y})",
-                f"Gaze: {gaze_status}"
-            ]
-            
-            # Log the gaze status (before any override) to match what's displayed
-            log_file.write(f"{datetime.datetime.now().isoformat()}: {gaze_status}\n")
-            log_file.flush()
-
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.7
-            thickness = 2
-            line_spacing = 30
-
-            for i, text in enumerate(texts):
-                (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-                center_x = (w - text_width) // 2
-                
-                color = (0, 255, 0)
-                cv2.putText(frame, text, (center_x, 30 + i * line_spacing), font, font_scale, color, thickness)
-
-        # Draw all landmark points in white
-        for idx, lm in enumerate(face_landmarks):
-            x, y = int(lm.x * w), int(lm.y * h)
-            cv2.circle(frame, (x, y), 0, (255, 255, 255), -1)
-
-    # Smooth orbit controls each frame
-    update_orbit_from_keys()
-
-    # Build 3D landmarks in your existing scale (x*w, y*h, z*w)
-    landmarks3d = None
-    if results.multi_face_landmarks:
-        lm = results.multi_face_landmarks[0].landmark
-        landmarks3d = np.array([[p.x * w, p.y * h, p.z * w] for p in lm], dtype=float)
-
-    # --- NEW: Eye-only gaze deviation detection ---
-    eye_only_status = "Eyes Centered (Head Ref)"
-    if 'R_final' in locals() and 'left_gaze_dir' in locals() and 'right_gaze_dir' in locals():
-                # Transform gaze directions into head's local coordinate system
-                # R_final.T is the inverse rotation, transforming world coords to local head coords
-                left_gaze_dir_local = R_final.T @ left_gaze_dir
-                right_gaze_dir_local = R_final.T @ right_gaze_dir
-        
-                eye_yaw_l, eye_pitch_l = get_yaw_pitch_from_vector(left_gaze_dir_local)
-                eye_yaw_r, eye_pitch_r = get_yaw_pitch_from_vector(right_gaze_dir_local)
-        
-                avg_eye_yaw_relative_head = (eye_yaw_l + eye_yaw_r) / 2
-                avg_eye_pitch_relative_head = (eye_pitch_l + eye_pitch_r) / 2
-        
-                if abs(avg_eye_yaw_relative_head) > EYE_YAW_THRESHOLD_DEG or \
-                   abs(avg_eye_pitch_relative_head) > EYE_PITCH_THRESHOLD_DEG:
-                    
-                    if avg_eye_yaw_relative_head > EYE_YAW_THRESHOLD_DEG:
-                        eye_only_status = "Eyes Left (Head Still)" # user's left
-                    elif avg_eye_yaw_relative_head < -EYE_YAW_THRESHOLD_DEG:
-                        eye_only_status = "Eyes Right (Head Still)" # user's right
-                    elif avg_eye_pitch_relative_head > EYE_PITCH_THRESHOLD_DEG:
-                        eye_only_status = "Eyes Up (Head Still)"
-                    elif avg_eye_pitch_relative_head < -EYE_PITCH_THRESHOLD_DEG:
-                        eye_only_status = "Eyes Down (Head Still)"
-                    else: # Catch-all for angular but not clearly directional deviation
-                        eye_only_status = "Eyes Away (Head Still)"
-    
-    # --- Combine gaze_status with eye_only_status ---
-    # If eyes move significantly relative to the head, treat that as
-    # a "looking away" condition even if the head is still.
-    if 'gaze_status' in locals() and eye_only_status != "Eyes Centered (Head Ref)":
-        gaze_status = "Looking Away (Eyes Only)"
-
-    # Don't log again here - already logged above with the screen-displayed value
-    # log_file.write(f"{datetime.datetime.now().isoformat()}: {gaze_status}\n")
-    # log_file.flush()
-
-    # --- Add eye-only status to displayed text ---
-    if 'texts' in locals():
-        texts.append(f"Eye Status: {eye_only_status}")
-
-    render_debug_view_orbit(
-        h, w,
-        head_center3d=head_center if 'head_center' in locals() else None,
-        sphere_world_l=sphere_world_l if left_sphere_locked and 'sphere_world_l' in locals() else None,
-        scaled_radius_l=scaled_radius_l if left_sphere_locked and 'scaled_radius_l' in locals() else None,
-        sphere_world_r=sphere_world_r if right_sphere_locked and 'sphere_world_r' in locals() else None,
-        scaled_radius_r=scaled_radius_r if right_sphere_locked and 'scaled_radius_r' in locals() else None,
-        iris3d_l=iris_3d_left if 'iris_3d_left' in locals() else None,
-        iris3d_r=iris_3d_right if 'iris_3d_right' in locals() else None,
-        left_locked=left_sphere_locked,
-        right_locked=right_sphere_locked,
-        landmarks3d=landmarks3d,
-        combined_dir=avg_combined_direction if 'avg_combined_direction' in locals() else None,
-        gaze_len=5230,
-        monitor_corners=monitor_corners,
-        monitor_center=monitor_center_w,
-        monitor_normal=monitor_normal_w,
-        gaze_markers=gaze_markers
+    # ── FaceMesh + video capture ───────────────────────────────────────────────
+    face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
     )
 
+    if args.video:
+        if not os.path.exists(args.video):
+            raise FileNotFoundError(f"Video file not found: {args.video}")
+        cap = cv2.VideoCapture(args.video)
+        print(f"[Video Mode] Using file: {args.video}", flush=True)
+    else:
+        cap = cv2.VideoCapture(0)
+        print("[Camera Mode] Using live webcam", flush=True)
+
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     if not HEADLESS_MODE:
-        cv2.imshow("Integrated Eye Tracking", frame)
+        cv2.namedWindow("Integrated Eye Tracking", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Head/Eye Debug", cv2.WINDOW_NORMAL)
 
-        # Minimize windows after first frame is shown
-        if not windows_minimized:
-            minimize_cv2_windows()
-            windows_minimized = True
+    # Start mouse movement thread
+    threading.Thread(target=mouse_mover, daemon=True).start()
 
-    # Handle keyboard input
-    if keyboard.is_pressed('f7'):
-        mouse_control_enabled = not mouse_control_enabled
-        print(f"[Mouse Control] {'Enabled' if mouse_control_enabled else 'Disabled'}")
-        time.sleep(0.3)  # debounce to prevent rapid toggling
+    # ── Local tracking state ───────────────────────────────────────────────────
+    combined_gaze_directions = deque(maxlen=filter_length)
+    R_ref_nose               = [None]
+    R_ref_forehead           = [None]
+    calibration_nose_scale   = None
+    monitor_corners          = None
+    monitor_center_w         = None
+    monitor_normal_w         = None
+    calibration_offset_yaw   = 0
+    calibration_offset_pitch = 0
+    calib_step               = 0
+    # units_per_cm is a module global (read by render_debug_view_orbit)
 
-    # Auto-calibration: 0.5 s for prerecorded video, 3 s for live webcam
-    _calib_wait = 0.5 if args.video else 3.0
-    if not auto_calibrated and not (left_sphere_locked and right_sphere_locked):
-        elapsed_time = virtual_time - auto_calibration_start_time
-        if elapsed_time >= _calib_wait:  # Wait before auto-calibrating
+    # Eye sphere tracking variables
+    left_sphere_locked          = False
+    left_sphere_local_offset    = None
+    left_calibration_nose_scale = None
+
+    right_sphere_locked          = False
+    right_sphere_local_offset    = None
+    right_calibration_nose_scale = None
+
+    # Auto-calibration state
+    auto_calibrated          = False
+    auto_calibration_start_time = 0.0  # Virtual clock; counts from first frame
+
+    # Session-specific log file
+    script_dir    = os.path.dirname(__file__)
+    data_dir      = os.path.join(script_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    log_file_path = os.path.join(data_dir, f"gaze_log_{args.session_id}.txt")
+    log_file      = open(log_file_path, "w")  # 'w' mode to create new file for each session
+    print(f"=" * 60, flush=True)
+    print(f"Vision.py Starting - Session: {args.session_id}", flush=True)
+    print(f"Logging gaze data to: {log_file_path}", flush=True)
+    print(f"Headless mode: {HEADLESS_MODE}", flush=True)
+    print(f"=" * 60, flush=True)
+
+    # === Recording Configuration ===
+    RECORDING_INTERVAL    = 15       # seconds per chunk
+    AUDIO_SAMPLE_RATE     = 44100    # 44.1 kHz
+    AUDIO_CHANNELS        = 2        # Stereo
+
+    # Recording state
+    recording_enabled       = True
+    audio_recording_enabled = False  # Audio is optional
+    current_chunk           = 0
+    chunk_start_time        = 0.0    # Virtual clock; counts from first frame
+    audio_queue             = queue.Queue()
+    video_writer            = None
+    audio_buffer            = []
+    audio_stream            = None
+
+    # ── Nested recording helpers (capture data_dir / args / audio_queue) ──────
+
+    def get_chunk_filename(chunk_num, extension):
+        """Generate filename for recording chunk"""
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.join(data_dir, f"{args.session_id}_chunk{chunk_num:03d}_{timestamp}.{extension}")
+
+    def audio_callback(indata, frames, time_info, status):
+        """Callback for audio recording - runs in separate thread"""
+        if status:
+            print(f"Audio callback status: {status}")
+        audio_queue.put(indata.copy())
+
+    def save_audio_chunk(audio_data, chunk_num):
+        """Save accumulated audio data to file"""
+        if len(audio_data) == 0:
+            return
+        audio_array = np.concatenate(audio_data, axis=0)
+        filename = get_chunk_filename(chunk_num, "wav")
+        try:
+            sf.write(filename, audio_array, AUDIO_SAMPLE_RATE)
+            print(f"💾 Saved audio chunk: {filename} ({len(audio_array)/AUDIO_SAMPLE_RATE:.1f}s)")
+        except Exception as e:
+            print(f"❌ Error saving audio: {e}")
+
+    def start_new_video_chunk(chunk_num, frame_width, frame_height, fps):
+        """Create new video writer for chunk"""
+        filename = get_chunk_filename(chunk_num, "mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(filename, fourcc, fps, (frame_width, frame_height))
+        if not writer.isOpened():
+            print(f"ERROR: Could not open video writer for {filename}", flush=True)
+            return None
+        print(f"Started video chunk: {filename}", flush=True)
+        return writer
+
+    # Disable audio capture when processing a video file (no live mic needed)
+    if args.video:
+        audio_recording_enabled = False
+        recording_enabled = True   # video-only recording still OK
+
+    # Start audio recording stream (optional - won't disable video if this fails)
+    if recording_enabled and not args.video:
+        try:
+            audio_stream = sd.InputStream(
+                samplerate=AUDIO_SAMPLE_RATE,
+                channels=AUDIO_CHANNELS,
+                callback=audio_callback
+            )
+            audio_stream.start()
+            audio_recording_enabled = True
+            print(f"Audio recording started (Session: {args.session_id})", flush=True)
+            print(f"Recording chunks every {RECORDING_INTERVAL} seconds", flush=True)
+        except Exception as e:
+            print(f"WARNING: Audio recording disabled - {e}", flush=True)
+            print(f"Video-only recording will continue every {RECORDING_INTERVAL} seconds", flush=True)
+            audio_recording_enabled = False
+            # Keep recording_enabled = True for video
+
+    # Flag to track if windows have been minimized
+    windows_minimized = False
+
+    # Initialize video recording
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps is None or fps <= 1:
+        fps = 30.0
+    fps = float(fps)
+    frame_dt = 1.0 / fps
+    if recording_enabled:
+        video_writer = start_new_video_chunk(current_chunk, w, h, fps)
+
+    # Virtual clock: advances by frame_dt * speed per frame (deterministic for video files)
+    virtual_time = 0.0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+
+        if not ret:
+            if args.video and args.loop:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                virtual_time = 0.0
+                print("[Video] Looping video", flush=True)
+                continue
+            else:
+                print("[Video] End of file reached" if args.video else "[Camera] Stream ended", flush=True)
+                break
+
+        # Advance virtual clock each frame (deterministic; replaces time.time() in timing logic)
+        virtual_time += frame_dt * args.speed
+
+        # === Recording Management ===
+        if recording_enabled:
+            current_time = virtual_time
+            elapsed = current_time - chunk_start_time
+
+            # Write current frame to video (frame.copy() avoids buffer-reuse issues
+            # when the source is a file-backed decoder)
+            if video_writer is not None:
+                video_writer.write(frame.copy())
+
+            # Collect audio from queue (only if audio is enabled)
+            if audio_recording_enabled:
+                while not audio_queue.empty():
+                    audio_buffer.append(audio_queue.get())
+
+            # Check if it's time to save chunk and start new one
+            if elapsed >= RECORDING_INTERVAL:
+                print(f"\nChunk {current_chunk} complete ({elapsed:.1f}s)", flush=True)
+
+                # Save and close current video
+                if video_writer is not None:
+                    video_writer.release()
+                    print(f"Saved video chunk {current_chunk}", flush=True)
+
+                # Save audio (only if audio recording is enabled)
+                if audio_recording_enabled:
+                    save_audio_chunk(audio_buffer, current_chunk)
+
+                # Start new chunk
+                current_chunk += 1
+                chunk_start_time = current_time
+                audio_buffer = []
+                video_writer = start_new_video_chunk(current_chunk, w, h, fps)
+
+        combined_dir = None  # will be filled once you compute a smoothed direction
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_mesh.process(frame_rgb)
+
+        if results.multi_face_landmarks:
+            face_landmarks = results.multi_face_landmarks[0].landmark
+            gaze_status = "Detecting Gaze" # Initialize gaze_status
+
+            # Index for left iris center point (from MediaPipe's iris model)
+            left_iris_idx = 468
+            right_iris_idx = 473
+            left_iris = face_landmarks[left_iris_idx]
+            right_iris = face_landmarks[right_iris_idx]
+
+            # Compute and draw stabilized coordinate frame from nose region
+            head_center, R_final, nose_points_3d = compute_and_draw_coordinate_box(
+                frame,
+                face_landmarks,
+                nose_indices,
+                R_ref_nose,
+                color=(0, 255, 0),
+                size=80,
+                w_frame=w, h_frame=h,
+            )
+
+            # TODO compute this radius using canthus during calibration
+            base_radius = 20  # radius at calibration distance
+
+            x_iris_l = int(left_iris.x * w)
+            y_iris_l = int(left_iris.y * h)
+            # === LEFT EYE visualization ===
+            if not left_sphere_locked:
+                cv2.circle(frame, (x_iris_l, y_iris_l), 10, (255, 25, 25), 2)
+            else:
+                current_nose_scale = compute_scale(nose_points_3d)
+                scale_ratio = current_nose_scale / left_calibration_nose_scale if left_calibration_nose_scale else 1.0
+                scaled_offset = left_sphere_local_offset * scale_ratio
+                sphere_world_l = head_center + R_final @ scaled_offset
+                x_sphere_l, y_sphere_l = int(sphere_world_l[0]), int(sphere_world_l[1])
+                scaled_radius_l = int(base_radius * scale_ratio)
+                cv2.circle(frame, (x_sphere_l, y_sphere_l), scaled_radius_l, (255, 255, 25), 2)
+
+            x_iris_r = int(right_iris.x * w)
+            y_iris_r = int(right_iris.y * h)
+            # === RIGHT EYE visualization ===
+            if not right_sphere_locked:
+                cv2.circle(frame, (x_iris_r, y_iris_r), 10, (25, 255, 25), 2)
+            else:
+                current_nose_scale = compute_scale(nose_points_3d)
+                scale_ratio_r = current_nose_scale / right_calibration_nose_scale if right_calibration_nose_scale else 1.0
+                scaled_offset_r = right_sphere_local_offset * scale_ratio_r
+                sphere_world_r = head_center + R_final @ scaled_offset_r
+                x_sphere_r, y_sphere_r = int(sphere_world_r[0]), int(sphere_world_r[1])
+                scaled_radius_r = int(base_radius * scale_ratio_r)
+                cv2.circle(frame, (x_sphere_r, y_sphere_r), scaled_radius_r, (25, 255, 255), 2)
+
+            iris_3d_left = np.array([left_iris.x * w, left_iris.y * h, left_iris.z * w])
+            iris_3d_right = np.array([right_iris.x * w, right_iris.y * h, right_iris.z * w])
+
+            if left_sphere_locked and right_sphere_locked:
+                # ==== DRAW LEFT AND RIGHT GAZE ====
+                draw_gaze(frame, sphere_world_l, iris_3d_left, scaled_radius_l, (55, 255, 0), 130)
+                draw_gaze(frame, sphere_world_r, iris_3d_right, scaled_radius_r, (55, 255, 0), 130)
+
+                # ==== COMPUTE COMBINED GAZE DIRECTION FOR SCREEN MAPPING ====
+                # Calculate individual gaze directions
+                left_gaze_dir = iris_3d_left - sphere_world_l
+                left_gaze_dir /= np.linalg.norm(left_gaze_dir)
+
+                right_gaze_dir = iris_3d_right - sphere_world_r
+                right_gaze_dir /= np.linalg.norm(right_gaze_dir)
+
+                # Combine gaze directions (average)
+                raw_combined_direction = (left_gaze_dir + right_gaze_dir) / 2
+                raw_combined_direction /= np.linalg.norm(raw_combined_direction)
+
+                # Update direction buffer for smoothing
+                combined_gaze_directions.append(raw_combined_direction)
+
+                # Smoothed direction
+                avg_combined_direction = np.mean(combined_gaze_directions, axis=0)
+                avg_combined_direction /= np.linalg.norm(avg_combined_direction)
+
+                combined_dir = avg_combined_direction
+
+                # ==== CONVERT GAZE TO SCREEN COORDINATES ====
+                screen_x, screen_y, raw_yaw, raw_pitch, gaze_status = convert_gaze_to_screen_coordinates(
+                    avg_combined_direction,
+                    calibration_offset_yaw,
+                    calibration_offset_pitch
+                )
+                print(f"Gaze Status: {gaze_status}")
+
+                # Update mouse target
+                if mouse_control_enabled:
+                    with mouse_lock:
+                        mouse_target[0] = screen_x
+                        mouse_target[1] = screen_y
+
+                # ===== NEW: Write screen position to file =====
+                write_screen_position(screen_x, screen_y)
+
+                # Draw combined gaze ray for visualization
+                combined_origin = (sphere_world_l + sphere_world_r) / 2
+                combined_target = combined_origin + avg_combined_direction * gaze_length
+                cv2.line(
+                    frame,
+                    (int(combined_origin[0]), int(combined_origin[1])),
+                    (int(combined_target[0]), int(combined_target[1])),
+                    (255, 255, 10), 3
+                )
+
+                # Center multiple lines of text
+                texts = [
+                    f"Screen: ({screen_x}, {screen_y})",
+                    f"Gaze: {gaze_status}"
+                ]
+
+                # Log the gaze status (before any override) to match what's displayed
+                log_file.write(f"{datetime.datetime.now().isoformat()}: {gaze_status}\n")
+                log_file.flush()
+
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.7
+                thickness = 2
+                line_spacing = 30
+
+                for i, text in enumerate(texts):
+                    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+                    center_x = (w - text_width) // 2
+
+                    color = (0, 255, 0)
+                    cv2.putText(frame, text, (center_x, 30 + i * line_spacing), font, font_scale, color, thickness)
+
+            # Draw all landmark points in white
+            for idx, lm in enumerate(face_landmarks):
+                x, y = int(lm.x * w), int(lm.y * h)
+                cv2.circle(frame, (x, y), 0, (255, 255, 255), -1)
+
+        # Smooth orbit controls each frame
+        update_orbit_from_keys()
+
+        # Build 3D landmarks in your existing scale (x*w, y*h, z*w)
+        landmarks3d = None
+        if results.multi_face_landmarks:
+            lm = results.multi_face_landmarks[0].landmark
+            landmarks3d = np.array([[p.x * w, p.y * h, p.z * w] for p in lm], dtype=float)
+
+        # --- NEW: Eye-only gaze deviation detection ---
+        eye_only_status = "Eyes Centered (Head Ref)"
+        if 'R_final' in locals() and 'left_gaze_dir' in locals() and 'right_gaze_dir' in locals():
+                    # Transform gaze directions into head's local coordinate system
+                    # R_final.T is the inverse rotation, transforming world coords to local head coords
+                    left_gaze_dir_local = R_final.T @ left_gaze_dir
+                    right_gaze_dir_local = R_final.T @ right_gaze_dir
+
+                    eye_yaw_l, eye_pitch_l = get_yaw_pitch_from_vector(left_gaze_dir_local)
+                    eye_yaw_r, eye_pitch_r = get_yaw_pitch_from_vector(right_gaze_dir_local)
+
+                    avg_eye_yaw_relative_head = (eye_yaw_l + eye_yaw_r) / 2
+                    avg_eye_pitch_relative_head = (eye_pitch_l + eye_pitch_r) / 2
+
+                    if abs(avg_eye_yaw_relative_head) > EYE_YAW_THRESHOLD_DEG or \
+                       abs(avg_eye_pitch_relative_head) > EYE_PITCH_THRESHOLD_DEG:
+
+                        if avg_eye_yaw_relative_head > EYE_YAW_THRESHOLD_DEG:
+                            eye_only_status = "Eyes Left (Head Still)" # user's left
+                        elif avg_eye_yaw_relative_head < -EYE_YAW_THRESHOLD_DEG:
+                            eye_only_status = "Eyes Right (Head Still)" # user's right
+                        elif avg_eye_pitch_relative_head > EYE_PITCH_THRESHOLD_DEG:
+                            eye_only_status = "Eyes Up (Head Still)"
+                        elif avg_eye_pitch_relative_head < -EYE_PITCH_THRESHOLD_DEG:
+                            eye_only_status = "Eyes Down (Head Still)"
+                        else: # Catch-all for angular but not clearly directional deviation
+                            eye_only_status = "Eyes Away (Head Still)"
+
+        # --- Combine gaze_status with eye_only_status ---
+        # If eyes move significantly relative to the head, treat that as
+        # a "looking away" condition even if the head is still.
+        if 'gaze_status' in locals() and eye_only_status != "Eyes Centered (Head Ref)":
+            gaze_status = "Looking Away (Eyes Only)"
+
+        # Don't log again here - already logged above with the screen-displayed value
+        # log_file.write(f"{datetime.datetime.now().isoformat()}: {gaze_status}\n")
+        # log_file.flush()
+
+        # --- Add eye-only status to displayed text ---
+        if 'texts' in locals():
+            texts.append(f"Eye Status: {eye_only_status}")
+
+        render_debug_view_orbit(
+            h, w,
+            head_center3d=head_center if 'head_center' in locals() else None,
+            sphere_world_l=sphere_world_l if left_sphere_locked and 'sphere_world_l' in locals() else None,
+            scaled_radius_l=scaled_radius_l if left_sphere_locked and 'scaled_radius_l' in locals() else None,
+            sphere_world_r=sphere_world_r if right_sphere_locked and 'sphere_world_r' in locals() else None,
+            scaled_radius_r=scaled_radius_r if right_sphere_locked and 'scaled_radius_r' in locals() else None,
+            iris3d_l=iris_3d_left if 'iris_3d_left' in locals() else None,
+            iris3d_r=iris_3d_right if 'iris_3d_right' in locals() else None,
+            left_locked=left_sphere_locked,
+            right_locked=right_sphere_locked,
+            landmarks3d=landmarks3d,
+            combined_dir=avg_combined_direction if 'avg_combined_direction' in locals() else None,
+            gaze_len=5230,
+            monitor_corners=monitor_corners,
+            monitor_center=monitor_center_w,
+            monitor_normal=monitor_normal_w,
+            gaze_markers=gaze_markers
+        )
+
+        if not HEADLESS_MODE:
+            cv2.imshow("Integrated Eye Tracking", frame)
+
+            # Minimize windows after first frame is shown
+            if not windows_minimized:
+                minimize_cv2_windows()
+                windows_minimized = True
+
+        # Handle keyboard input
+        if keyboard.is_pressed('f7'):
+            mouse_control_enabled = not mouse_control_enabled
+            print(f"[Mouse Control] {'Enabled' if mouse_control_enabled else 'Disabled'}")
+            time.sleep(0.3)  # debounce to prevent rapid toggling
+
+        # Auto-calibration: 0.5 s for prerecorded video, 3 s for live webcam
+        _calib_wait = 0.5 if args.video else 3.0
+        if not auto_calibrated and not (left_sphere_locked and right_sphere_locked):
+            elapsed_time = virtual_time - auto_calibration_start_time
+            if elapsed_time >= _calib_wait:  # Wait before auto-calibrating
+                current_nose_scale = compute_scale(nose_points_3d)
+                # Lock LEFT eye
+                left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)
+                camera_dir_world = np.array([0, 0, 1])
+                camera_dir_local = R_final.T @ camera_dir_world
+                left_sphere_local_offset += base_radius * camera_dir_local
+                left_calibration_nose_scale = current_nose_scale
+                left_sphere_locked = True
+
+                # Lock RIGHT eye
+                right_sphere_local_offset = R_final.T @ (iris_3d_right - head_center)
+                right_sphere_local_offset += base_radius * camera_dir_local
+                right_calibration_nose_scale = current_nose_scale
+                right_sphere_locked = True
+
+                # === Create 3D monitor plane at calibration ===
+                sphere_world_l_calib = head_center + R_final @ left_sphere_local_offset
+                sphere_world_r_calib = head_center + R_final @ right_sphere_local_offset
+
+                # Estimate a forward gaze direction from the two eyes
+                left_dir  = iris_3d_left  - sphere_world_l_calib
+                right_dir = iris_3d_right - sphere_world_r_calib
+                # Normalize (guard zero)
+                if np.linalg.norm(left_dir)  > 1e-9: left_dir  /= np.linalg.norm(left_dir)
+                if np.linalg.norm(right_dir) > 1e-9: right_dir /= np.linalg.norm(right_dir)
+                forward_hint = (left_dir + right_dir) * 0.5
+                if np.linalg.norm(forward_hint) > 1e-9:
+                    forward_hint /= np.linalg.norm(forward_hint)
+                else:
+                    forward_hint = None
+
+                gaze_origin = (sphere_world_l_calib + sphere_world_r_calib) / 2
+                gaze_dir = forward_hint
+
+                monitor_corners, monitor_center_w, monitor_normal_w, units_per_cm = create_monitor_plane(
+                    head_center, R_final, face_landmarks, w, h,
+                    forward_hint=forward_hint,
+                    gaze_origin=gaze_origin,
+                    gaze_dir=gaze_dir
+                )
+
+                # Freeze the debug world's orbit pivot at the calibrated monitor center
+                debug_world_frozen = True
+                orbit_pivot_frozen = monitor_center_w.copy()
+                print("[Auto-Calibration] Eye sphere calibration complete - gaze tracking started!")
+                print(f"[Monitor] units_per_cm={units_per_cm:.3f}, center={monitor_center_w}, normal={monitor_normal_w}")
+
+                auto_calibrated = True
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('c'):
+            # Manual recalibration (can be done anytime)
             current_nose_scale = compute_scale(nose_points_3d)
             # Lock LEFT eye
             left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)
@@ -1270,175 +1546,127 @@ while cap.isOpened():
             # Freeze the debug world's orbit pivot at the calibrated monitor center
             debug_world_frozen = True
             orbit_pivot_frozen = monitor_center_w.copy()
-            print("[Auto-Calibration] Eye sphere calibration complete - gaze tracking started!")
+            print("[Manual Recalibration] Eye sphere calibration complete!")
             print(f"[Monitor] units_per_cm={units_per_cm:.3f}, center={monitor_center_w}, normal={monitor_normal_w}")
-            
-            auto_calibrated = True
+        elif key == ord('s') and left_sphere_locked and right_sphere_locked:
+            # Screen calibration - user should look at center of screen when pressing 's'
+            # Get current gaze direction
+            left_gaze_dir = iris_3d_left - sphere_world_l
+            left_gaze_dir /= np.linalg.norm(left_gaze_dir)
+            right_gaze_dir = iris_3d_right - sphere_world_r
+            right_gaze_dir /= np.linalg.norm(right_gaze_dir)
+            current_combined_direction = (left_gaze_dir + right_gaze_dir) / 2
+            current_combined_direction /= np.linalg.norm(current_combined_direction)
 
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
-        break
-    elif key == ord('c'):
-        # Manual recalibration (can be done anytime)
-        current_nose_scale = compute_scale(nose_points_3d)
-        # Lock LEFT eye
-        left_sphere_local_offset = R_final.T @ (iris_3d_left - head_center)
-        camera_dir_world = np.array([0, 0, 1])
-        camera_dir_local = R_final.T @ camera_dir_world
-        left_sphere_local_offset += base_radius * camera_dir_local
-        left_calibration_nose_scale = current_nose_scale
-        left_sphere_locked = True
+            # Calculate what the raw angles would be without calibration
+            _, _, raw_yaw, raw_pitch, _ = convert_gaze_to_screen_coordinates(
+                current_combined_direction, 0, 0  # no calibration offset
+            )
 
-        # Lock RIGHT eye
-        right_sphere_local_offset = R_final.T @ (iris_3d_right - head_center)
-        right_sphere_local_offset += base_radius * camera_dir_local
-        right_calibration_nose_scale = current_nose_scale
-        right_sphere_locked = True
+            # Set calibration offsets to center the gaze
+            calibration_offset_yaw = 0 - raw_yaw
+            calibration_offset_pitch = 0 - raw_pitch
 
-        # === Create 3D monitor plane at calibration ===
-        sphere_world_l_calib = head_center + R_final @ left_sphere_local_offset
-        sphere_world_r_calib = head_center + R_final @ right_sphere_local_offset
+            print(f"[Screen Calibrated] Offset Yaw: {calibration_offset_yaw:.2f}, Offset Pitch: {calibration_offset_pitch:.2f}")
+        elif key == ord('x'):
+            # Drop a marker at the current gaze∩monitor point
+            if (monitor_corners is not None and monitor_center_w is not None and monitor_normal_w is not None
+                and left_sphere_locked and right_sphere_locked):
+                # Recompute current eye-sphere positions (scale-aware)
+                current_nose_scale = compute_scale(nose_points_3d)
+                scale_ratio_l = current_nose_scale / left_calibration_nose_scale if left_calibration_nose_scale else 1.0
+                scale_ratio_r = current_nose_scale / right_calibration_nose_scale if right_calibration_nose_scale else 1.0
+                sphere_world_l_now = head_center + R_final @ (left_sphere_local_offset * scale_ratio_l)
+                sphere_world_r_now = head_center + R_final @ (right_sphere_local_offset * scale_ratio_r)
 
-        # Estimate a forward gaze direction from the two eyes
-        left_dir  = iris_3d_left  - sphere_world_l_calib
-        right_dir = iris_3d_right - sphere_world_r_calib
-        # Normalize (guard zero)
-        if np.linalg.norm(left_dir)  > 1e-9: left_dir  /= np.linalg.norm(left_dir)
-        if np.linalg.norm(right_dir) > 1e-9: right_dir /= np.linalg.norm(right_dir)
-        forward_hint = (left_dir + right_dir) * 0.5
-        if np.linalg.norm(forward_hint) > 1e-9:
-            forward_hint /= np.linalg.norm(forward_hint)
-        else:
-            forward_hint = None
-
-        gaze_origin = (sphere_world_l_calib + sphere_world_r_calib) / 2
-        gaze_dir = forward_hint
-
-        monitor_corners, monitor_center_w, monitor_normal_w, units_per_cm = create_monitor_plane(
-            head_center, R_final, face_landmarks, w, h,
-            forward_hint=forward_hint,
-            gaze_origin=gaze_origin,
-            gaze_dir=gaze_dir
-        )
-
-        # Freeze the debug world's orbit pivot at the calibrated monitor center
-        debug_world_frozen = True
-        orbit_pivot_frozen = monitor_center_w.copy()
-        print("[Manual Recalibration] Eye sphere calibration complete!")
-        print(f"[Monitor] units_per_cm={units_per_cm:.3f}, center={monitor_center_w}, normal={monitor_normal_w}")
-    elif key == ord('s') and left_sphere_locked and right_sphere_locked:
-        # Screen calibration - user should look at center of screen when pressing 's'
-        # Get current gaze direction
-        left_gaze_dir = iris_3d_left - sphere_world_l
-        left_gaze_dir /= np.linalg.norm(left_gaze_dir)
-        right_gaze_dir = iris_3d_right - sphere_world_r
-        right_gaze_dir /= np.linalg.norm(right_gaze_dir)
-        current_combined_direction = (left_gaze_dir + right_gaze_dir) / 2
-        current_combined_direction /= np.linalg.norm(current_combined_direction)
-        
-        # Calculate what the raw angles would be without calibration
-        _, _, raw_yaw, raw_pitch, _ = convert_gaze_to_screen_coordinates(
-            current_combined_direction, 0, 0  # no calibration offset
-        )
-        
-        # Set calibration offsets to center the gaze
-        calibration_offset_yaw = 0 - raw_yaw
-        calibration_offset_pitch = 0 - raw_pitch
-        
-        print(f"[Screen Calibrated] Offset Yaw: {calibration_offset_yaw:.2f}, Offset Pitch: {calibration_offset_pitch:.2f}")
-    elif key == ord('x'):
-        # Drop a marker at the current gaze∩monitor point
-        if (monitor_corners is not None and monitor_center_w is not None and monitor_normal_w is not None
-            and left_sphere_locked and right_sphere_locked):
-            # Recompute current eye-sphere positions (scale-aware)
-            current_nose_scale = compute_scale(nose_points_3d)
-            scale_ratio_l = current_nose_scale / left_calibration_nose_scale if left_calibration_nose_scale else 1.0
-            scale_ratio_r = current_nose_scale / right_calibration_nose_scale if right_calibration_nose_scale else 1.0
-            sphere_world_l_now = head_center + R_final @ (left_sphere_local_offset * scale_ratio_l)
-            sphere_world_r_now = head_center + R_final @ (right_sphere_local_offset * scale_ratio_r)
-
-            # Combined gaze direction (use smoothed if available; otherwise instantaneous)
-            if 'avg_combined_direction' in locals() and avg_combined_direction is not None:
-                D = _normalize(np.asarray(avg_combined_direction, dtype=float))
-            else:
-                lg = iris_3d_left  - sphere_world_l_now
-                rg = iris_3d_right - sphere_world_r_now
-                if np.linalg.norm(lg) < 1e-9 or np.linalg.norm(rg) < 1e-9:
-                    print("[Marker] Gaze direction invalid; try again.")
-                    D = None
+                # Combined gaze direction (use smoothed if available; otherwise instantaneous)
+                if 'avg_combined_direction' in locals() and avg_combined_direction is not None:
+                    D = _normalize(np.asarray(avg_combined_direction, dtype=float))
                 else:
-                    lg /= np.linalg.norm(lg)
-                    rg /= np.linalg.norm(rg)
-                    D = _normalize(lg + rg)
-
-            if D is not None:
-                O = (sphere_world_l_now + sphere_world_r_now) * 0.5
-                C = np.asarray(monitor_center_w, dtype=float)
-                N = _normalize(np.asarray(monitor_normal_w, dtype=float))
-                denom = float(np.dot(N, D))
-                if abs(denom) < 1e-6:
-                    print("[Marker] Gaze ray parallel to monitor; no marker.")
-                else:
-                    t = float(np.dot(N, (C - O)) / denom)
-                    if t <= 0.0:
-                        print("[Marker] Intersection behind/at eye; no marker.")
+                    lg = iris_3d_left  - sphere_world_l_now
+                    rg = iris_3d_right - sphere_world_r_now
+                    if np.linalg.norm(lg) < 1e-9 or np.linalg.norm(rg) < 1e-9:
+                        print("[Marker] Gaze direction invalid; try again.")
+                        D = None
                     else:
-                        P = O + t * D  # world-space intersection
-                        # Map P to monitor local (a,b), then store if inside the quad
-                        p0, p1, p2, p3 = [np.asarray(p, dtype=float) for p in monitor_corners]
-                        u = p1 - p0
-                        v = p3 - p0
-                        u_len2 = float(np.dot(u, u))
-                        v_len2 = float(np.dot(v, v))
-                        if u_len2 > 1e-9 and v_len2 > 1e-9:
-                            wv = P - p0
-                            a = float(np.dot(wv, u) / u_len2)
-                            b = float(np.dot(wv, v) / v_len2)
-                            if 0.0 <= a <= 1.0 and 0.0 <= b <= 1.0:
-                                gaze_markers.append((a, b))
-                                print(f"[Marker] Added at a={a:.3f}, b={b:.3f}")
-                            else:
-                                print("[Marker] Gaze not on monitor; no marker.")
+                        lg /= np.linalg.norm(lg)
+                        rg /= np.linalg.norm(rg)
+                        D = _normalize(lg + rg)
+
+                if D is not None:
+                    O = (sphere_world_l_now + sphere_world_r_now) * 0.5
+                    C = np.asarray(monitor_center_w, dtype=float)
+                    N = _normalize(np.asarray(monitor_normal_w, dtype=float))
+                    denom = float(np.dot(N, D))
+                    if abs(denom) < 1e-6:
+                        print("[Marker] Gaze ray parallel to monitor; no marker.")
+                    else:
+                        t = float(np.dot(N, (C - O)) / denom)
+                        if t <= 0.0:
+                            print("[Marker] Intersection behind/at eye; no marker.")
                         else:
-                            print("[Marker] Monitor dimensions degenerate; no marker.")
-        else:
-            print("[Marker] Monitor/gaze not ready; complete center calibration first.")
+                            P = O + t * D  # world-space intersection
+                            # Map P to monitor local (a,b), then store if inside the quad
+                            p0, p1, p2, p3 = [np.asarray(p, dtype=float) for p in monitor_corners]
+                            u = p1 - p0
+                            v = p3 - p0
+                            u_len2 = float(np.dot(u, u))
+                            v_len2 = float(np.dot(v, v))
+                            if u_len2 > 1e-9 and v_len2 > 1e-9:
+                                wv = P - p0
+                                a = float(np.dot(wv, u) / u_len2)
+                                b = float(np.dot(wv, v) / v_len2)
+                                if 0.0 <= a <= 1.0 and 0.0 <= b <= 1.0:
+                                    gaze_markers.append((a, b))
+                                    print(f"[Marker] Added at a={a:.3f}, b={b:.3f}")
+                                else:
+                                    print("[Marker] Gaze not on monitor; no marker.")
+                            else:
+                                print("[Marker] Monitor dimensions degenerate; no marker.")
+            else:
+                print("[Marker] Monitor/gaze not ready; complete center calibration first.")
+
+    # === Cleanup Recording ===
+    if recording_enabled:
+        print("\n🛑 Stopping recording...")
+
+        # Save final video chunk if there's data
+        if video_writer is not None:
+            video_writer.release()
+            print(f"💾 Saved final video chunk {current_chunk}")
+
+        # Save remaining audio (only if audio recording is enabled)
+        if audio_recording_enabled:
+            while not audio_queue.empty():
+                audio_buffer.append(audio_queue.get())
+            save_audio_chunk(audio_buffer, current_chunk)
+
+        # Stop audio stream (only if it was started)
+        if audio_stream is not None:
+            try:
+                audio_stream.stop()
+                audio_stream.close()
+                print("🎤 Audio recording stopped")
+            except Exception:
+                pass
+
+        # Create stop signal for inference process
+        stop_signal_path = os.path.join(data_dir, f"{args.session_id}_stop.signal")
+        with open(stop_signal_path, 'w') as f:
+            f.write(str(time.time()))
+        print(f"🚦 Created stop signal: {stop_signal_path}")
+
+        print(f"✅ Recording complete: {current_chunk + 1} chunks saved")
+
+    cap.release()
+    cv2.destroyAllWindows()
+    log_file.close()
 
 
-# === Cleanup Recording ===
-if recording_enabled:
-    print("\n🛑 Stopping recording...")
-    
-    # Save final video chunk if there's data
-    if video_writer is not None:
-        video_writer.release()
-        print(f"💾 Saved final video chunk {current_chunk}")
-    
-    # Save remaining audio (only if audio recording is enabled)
-    if audio_recording_enabled:
-        while not audio_queue.empty():
-            audio_buffer.append(audio_queue.get())
-        save_audio_chunk(audio_buffer, current_chunk)
-    
-    # Stop audio stream (only if it was started)
-    if audio_stream is not None:
-        try:
-            audio_stream.stop()
-            audio_stream.close()
-            print("🎤 Audio recording stopped")
-        except:
-            pass
-    
-    # Create stop signal for inference process
-    stop_signal_path = os.path.join(data_dir, f"{args.session_id}_stop.signal")
-    with open(stop_signal_path, 'w') as f:
-        f.write(str(time.time()))
-    print(f"🚦 Created stop signal: {stop_signal_path}")
-    
-    print(f"✅ Recording complete: {current_chunk + 1} chunks saved")
+# ===========================================================================
+# Entry point
+# ===========================================================================
 
-cap.release()
+if __name__ == "__main__":
+    _run_interactive(_parser.parse_args())
 
-cv2.destroyAllWindows()
-
-log_file.close()

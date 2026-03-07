@@ -83,6 +83,8 @@ export function useVisionSession() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined);
+  const reconnectAttemptsRef = useRef<number>(0);
+  const MAX_RECONNECT_ATTEMPTS = 5;
   // Outbound message queue — holds messages we tried to send while WS was not open
   const outboundQueueRef = useRef<string[]>([]);
   // Per-chunk timeout handles — cleared when chunk_processed/chunk_error arrives
@@ -111,8 +113,7 @@ export function useVisionSession() {
       const ws = new WebSocket('ws://localhost:8000/ws');
       
       ws.onopen = () => {
-        console.log('✓ Connected to vision server');
-        setIsConnected(true);
+        console.log('✓ Connected to vision server');        reconnectAttemptsRef.current = 0;  // reset on successful connect        setIsConnected(true);
         setError(null);
         // Flush any queued messages
         const queue = outboundQueueRef.current.splice(0);
@@ -241,12 +242,20 @@ export function useVisionSession() {
         console.log('Disconnected from vision server');
         setIsConnected(false);
         setIsSessionActive(false);
-        
-        // Attempt reconnection after 3 seconds
-        reconnectTimeoutRef.current = setTimeout(() => {
-          console.log('Attempting to reconnect...');
-          connect();
-        }, 3000);
+
+        if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+          // Exponential back-off: 1s, 2s, 4s, 8s, 16s (capped at 30s)
+          const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 30_000);
+          console.log(
+            `[useVisionSession] Reconnecting in ${delay}ms ` +
+            `(attempt ${reconnectAttemptsRef.current + 1}/${MAX_RECONNECT_ATTEMPTS})...`
+          );
+          reconnectAttemptsRef.current += 1;
+          reconnectTimeoutRef.current = setTimeout(() => connect(), delay);
+        } else {
+          console.warn('[useVisionSession] Max reconnect attempts reached.');
+          setError('Cannot connect to vision server. Please refresh the page.');
+        }
       };
       
       wsRef.current = ws;
@@ -258,6 +267,7 @@ export function useVisionSession() {
   }, [_clearChunkTimeout]);
 
   const disconnect = useCallback(() => {
+    reconnectAttemptsRef.current = MAX_RECONNECT_ATTEMPTS; // prevent auto-reconnect on explicit disconnect
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
     }
@@ -330,6 +340,13 @@ export function useVisionSession() {
     []
   );
 
+  /** Manually reconnect — resets the back-off counter so retries resume. */
+  const reconnect = useCallback(() => {
+    reconnectAttemptsRef.current = 0;
+    if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+    connect();
+  }, [connect]);
+
   // Auto-connect on mount
   useEffect(() => {
     connect();
@@ -369,6 +386,6 @@ export function useVisionSession() {
     stopSession,
     processChunk,
     getStatus,
-    reconnect: connect,
+    reconnect,
   };
 }

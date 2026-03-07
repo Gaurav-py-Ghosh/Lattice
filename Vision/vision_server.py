@@ -17,12 +17,14 @@ New model (offline/batch):
 import asyncio
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +32,13 @@ from typing import Optional
 
 import cv2
 import numpy as np
+
+try:
+    import mediapipe as _mp
+    _MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    _mp = None
+    _MEDIAPIPE_AVAILABLE = False
 import soundfile as sf
 import torch
 import uvicorn
@@ -336,7 +345,126 @@ video_inference_analyzer = VideoInferenceAnalyzer()
 facial_expression_analyzer = FacialExpressionAnalyzer()
 
 # ---------------------------------------------------------------------------
-# FastAPI lifespan — eager-load all three models once at startup
+# GazeAnalyzer — thin wrapper around vision.analyze_video (full model)
+# ---------------------------------------------------------------------------
+
+class GazeAnalyzer:
+    """Delegates gaze analysis to vision.analyze_video (the full model).
+
+    analyze_video() creates its own FaceMesh context per call, so multiple
+    thread-pool workers can run concurrently without shared state.
+    """
+
+    def __init__(self):
+        self._available: bool = False
+        self._lock = threading.Lock()
+
+    def load(self) -> bool:
+        if self._available:
+            return True
+        with self._lock:
+            if self._available:
+                return True
+            try:
+                from vision import analyze_video  # noqa: F401
+                self._available = True
+                print("[GazeAnalyzer] Using vision.analyze_video (full model)")
+                return True
+            except Exception as exc:
+                print(f"[GazeAnalyzer] vision import failed — gaze tracking disabled: {exc}")
+                return False
+
+    @staticmethod
+    def _transcode_to_mp4(input_path: str, session_id: str) -> str | None:
+        """Transcode input video to a reliable mp4 (H.264) for MediaPipe.
+
+        Browser MediaRecorder produces webm/VP8 which OpenCV can open but
+        MediaPipe often fails to detect faces in. Transcoding to H.264 mp4
+        fixes frame timing and codec issues. Returns the mp4 path, or None
+        on failure (caller falls back to original path).
+        """
+        out_path = str(Path(input_path).parent / f"gaze_tmp_{session_id}.mp4")
+        _ffmpeg = os.environ.get("FFMPEG_PATH", "ffmpeg")
+        cmd = [
+            _ffmpeg, "-y", "-i", input_path,
+            "-vcodec", "libx264", "-preset", "ultrafast",
+            "-acodec", "aac", "-strict", "experimental",
+            out_path
+        ]
+        try:
+            result = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120
+            )
+            if result.returncode == 0 and os.path.exists(out_path):
+                return out_path
+        except Exception as exc:
+            print(f"[GazeAnalyzer:{session_id}] ffmpeg transcode failed: {exc}")
+        return None
+
+    def analyze(self, video_path: str, session_id: str = "tmp") -> list:
+        """Process a video file and return gaze log entries.
+
+        Each entry: {'timestamp': str, 'status': str}
+        Delegates entirely to vision.analyze_video which writes the log file
+        and returns the list of entries (includes eye-only deviation statuses).
+
+        WebM files from the browser are transcoded to H.264 mp4 first —
+        MediaPipe face detection is unreliable on VP8/VP9 streams.
+        """
+        if not self._available:
+            if not self.load():
+                return []
+
+        # Transcode webm → mp4 so MediaPipe gets reliable H.264 frames
+        transcoded_path = None
+        analysis_path = video_path
+        if video_path.lower().endswith(".webm"):
+            transcoded_path = self._transcode_to_mp4(video_path, session_id)
+            if transcoded_path:
+                analysis_path = transcoded_path
+            else:
+                print(f"[GazeAnalyzer:{session_id}] Transcode failed — trying original webm")
+
+        try:
+            from vision import analyze_video
+            return analyze_video(analysis_path, session_id)
+        except Exception as exc:
+            print(f"[GazeAnalyzer:{session_id}] ERROR: {exc}")
+            return []
+        finally:
+            if transcoded_path and os.path.exists(transcoded_path):
+                try:
+                    os.remove(transcoded_path)
+                except Exception:
+                    pass
+
+
+gaze_analyzer = GazeAnalyzer()
+
+# ---------------------------------------------------------------------------
+# Stale-upload cleanup — removes uploads older than 1 hour
+# ---------------------------------------------------------------------------
+
+def _cleanup_stale_uploads(max_age_seconds: int = 3600) -> None:
+    """Remove leftover upload files from previously crashed sessions."""
+    upload_dir = Path(__file__).parent / "data" / "uploads"
+    if not upload_dir.exists():
+        return
+    cutoff  = time.time() - max_age_seconds
+    removed = 0
+    for fpath in upload_dir.iterdir():
+        try:
+            if fpath.is_file() and fpath.stat().st_mtime < cutoff:
+                fpath.unlink()
+                removed += 1
+        except Exception as exc:
+            print(f"[Cleanup] Could not remove {fpath}: {exc}")
+    if removed:
+        print(f"[Startup] Cleaned up {removed} stale upload file(s) from {upload_dir}")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI lifespan — eager-load all four models once at startup
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
@@ -344,12 +472,17 @@ async def lifespan(app_: FastAPI):
     """Load all ML models in thread-pool workers at startup."""
     global CHUNK_SEMAPHORE
     CHUNK_SEMAPHORE = asyncio.Semaphore(3)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
+
+    # Remove stale uploads left over from any previous crashed sessions
+    _cleanup_stale_uploads()
+
     print("[Startup] Pre-loading all models…")
     await asyncio.gather(
         loop.run_in_executor(None, voice_analyzer.load),
         loop.run_in_executor(None, video_inference_analyzer.load),
         loop.run_in_executor(None, facial_expression_analyzer.load),
+        loop.run_in_executor(None, gaze_analyzer.load),
     )
     print("[Startup] All models ready.")
     # Check ffmpeg availability (required for voice analysis audio extraction)
@@ -602,70 +735,43 @@ async def _process_chunk(
     chunk_index: int,
     video_path: str,
 ) -> None:
-    """Process a single 15-s video chunk through all three analysis modules:
+    """Process a single 15-s video chunk through all four analysis modules:
 
-    1. vision.py              — gaze tracking (subprocess, exits at EOF)
+    1. gaze_analyzer          — gaze tracking via vision.analyze_video (in-process)
     2. video_inference_analyzer — VideoMAE confidence (in-process)
     3. facial_expression_analyzer — facial expression score (in-process)
     4. voice_analyzer         — speaking skills (in-process)
 
-    All three ML models run concurrently once vision.py exits.
+    All four ML models run concurrently via asyncio.gather.
     Semaphore limits to CHUNK_SEMAPHORE concurrent chunks.
     Files are cleaned up in the finally block.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     async with CHUNK_SEMAPHORE:
-        # ---- Create a mini VisionSession for gaze tracking only ----
-        session = VisionSession(chunk_id, video_path=video_path)
-
-        # Run session.start() in executor — it contains time.sleep() calls
-        # that would otherwise block the event loop
-        await loop.run_in_executor(None, session.start)
-
-        if not session.is_running:
-            try:
-                await websocket.send_json({
-                    'type': 'chunk_error',
-                    'chunk_id': chunk_id,
-                    'chunk_index': chunk_index,
-                    'message': f'Failed to start gaze session for chunk {chunk_id}',
-                })
-            except Exception:
-                pass
-            # Clean up the uploaded video even on early failure
-            try:
-                if os.path.exists(video_path):
-                    os.remove(video_path)
-            except Exception:
-                pass
-            return
+        gaze_log_path = Path(__file__).parent / "data" / f"gaze_log_{chunk_id}.txt"
 
         try:
-            # ---- Wait for vision.py to finish (it exits at EOF) ----
-            await loop.run_in_executor(None, session.vision_process.wait)
-            print(f"[Chunk {chunk_index}] vision.py finished (PID {session.vision_process.pid})")
+            # ---- Run all four ML analyses concurrently ----
+            gaze_task   = loop.run_in_executor(None, gaze_analyzer.analyze,               video_path, chunk_id)
+            voice_task  = loop.run_in_executor(None, voice_analyzer.analyze,              video_path, chunk_id)
+            video_task  = loop.run_in_executor(None, video_inference_analyzer.analyze,    video_path, chunk_id)
+            facial_task = loop.run_in_executor(None, facial_expression_analyzer.analyze,  video_path, chunk_id)
 
-            # ---- Run all three ML analyses concurrently ----
-            voice_task = loop.run_in_executor(
-                None, voice_analyzer.analyze, video_path, chunk_id
+            gaze_data, voice_result, video_result, facial_result = await asyncio.gather(
+                gaze_task, voice_task, video_task, facial_task
             )
-            video_task = loop.run_in_executor(
-                None, video_inference_analyzer.analyze, video_path, chunk_id
-            )
-            facial_task = loop.run_in_executor(
-                None, facial_expression_analyzer.analyze, video_path, chunk_id
-            )
-
-            gaze_data = session.get_log_data()
 
             # Compute gaze summary stats from raw log entries
             gaze_counts = {"Looking Forward": 0, "Looking Left": 0,
-                           "Looking Right": 0, "Looking Away": 0}
+                           "Looking Right": 0, "Looking Away": 0,
+                           "Looking Away (Eyes Only)": 0}
             for entry in gaze_data:
                 s = entry.get("status", "")
                 if s in gaze_counts:
                     gaze_counts[s] += 1
+            # Merge eye-only away into Looking Away for backwards-compat summary
+            gaze_counts["Looking Away"] += gaze_counts.pop("Looking Away (Eyes Only)", 0)
             gaze_total = sum(gaze_counts.values()) or 1  # avoid div-by-zero
             gaze_summary = {
                 "total_frames": gaze_total,
@@ -678,10 +784,6 @@ async def _process_chunk(
                 "looking_right_pct":   round(gaze_counts["Looking Right"]   / gaze_total * 100, 1),
                 "looking_away_pct":    round(gaze_counts["Looking Away"]    / gaze_total * 100, 1),
             } if gaze_data else {}
-
-            voice_result, video_result, facial_result = await asyncio.gather(
-                voice_task, video_task, facial_task
-            )
 
             # Build a predictions list from the in-process VideoMAE result
             # so the frontend's existing ChunkResult shape stays compatible
@@ -703,7 +805,8 @@ async def _process_chunk(
 
             print(
                 f"[Chunk {chunk_index}] Done: "
-                f"gaze={len(gaze_data)} (L={gaze_summary.get('looking_left',0)} R={gaze_summary.get('looking_right',0)} F={gaze_summary.get('looking_forward',0)}), "
+                f"gaze={len(gaze_data)} (L={gaze_summary.get('looking_left',0)} "
+                f"R={gaze_summary.get('looking_right',0)} F={gaze_summary.get('looking_forward',0)}), "
                 f"confidence={video_result.get('score')}, "
                 f"facial={facial_result.get('score')}, "
                 f"voice={voice_result.get('score')}"
@@ -736,14 +839,10 @@ async def _process_chunk(
             except Exception:
                 print(f"[Chunk {chunk_index}] Could not send chunk_error — client disconnected")
         finally:
-            session.stop()
             # ---- Clean up all files produced by this chunk ----
             files_to_delete = [
                 video_path,
-                str(session.log_file_path),
-                str(session.vision_log),
-                str(session.inference_log),
-                str(session.predictions_file),
+                str(gaze_log_path),
                 str(Path(video_path).parent / f"voice_tmp_{chunk_id}.wav"),
             ]
             for fpath in files_to_delete:
@@ -816,7 +915,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 session = VisionSession(session_id,
                                         video_path=video_path, loop=loop, speed=speed)
                 # Run in executor — start() contains time.sleep() that would block the event loop
-                await asyncio.get_event_loop().run_in_executor(None, session.start)
+                await asyncio.get_running_loop().run_in_executor(None, session.start)
 
                 active_sessions[session_id] = session
                 current_session = session
@@ -864,7 +963,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     voice_result = None
                     if current_session.video_path:
                         print(f"Running voice analysis on: {current_session.video_path}")
-                        loop_ref = asyncio.get_event_loop()
+                        loop_ref = asyncio.get_running_loop()
                         voice_result = await loop_ref.run_in_executor(
                             None,
                             voice_analyzer.analyze,
@@ -970,7 +1069,7 @@ async def analyze_voice(file: UploadFile = File(...)):
     print(f"[analyze_voice] Received: {file_path}")
 
     # Run analysis in thread pool so we don't block the event loop
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(
         None, voice_analyzer.analyze, str(file_path), file_id
     )
