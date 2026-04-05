@@ -172,24 +172,28 @@ export default function InterviewRoom() {
 
   const handleCalibrationComplete = () => {
     setShowCalibration(false);
-    setInterviewStarted(true);
 
-    // Enter fullscreen mode
-    enterFullscreen();
+    // Let the calibration overlay unmount before starting interview UX/actions.
+    requestAnimationFrame(() => {
+      setInterviewStarted(true);
 
-    // Start 15-s chunk recording now that permissions are already granted
-    if (permissionGranted && cameraStream) {
-      console.log('🎥 Starting chunked recording (15-s chunks) ...');
-      startRecorder(cameraStream);
-    } else {
-      console.warn('Camera stream not ready — requesting permissions again');
-      requestPermissions().then((s) => {
-        if (s) {
-          startRecorder(s);
-          if (videoRef.current) videoRef.current.srcObject = s;
-        }
-      });
-    }
+      // Enter fullscreen mode
+      enterFullscreen();
+
+      // Start 15-s chunk recording now that permissions are already granted
+      if (permissionGranted && cameraStream) {
+        console.log('🎥 Starting chunked recording (15-s chunks) ...');
+        startRecorder(cameraStream);
+      } else {
+        console.warn('Camera stream not ready — requesting permissions again');
+        requestPermissions().then((s) => {
+          if (s) {
+            startRecorder(s);
+            if (videoRef.current) videoRef.current.srcObject = s;
+          }
+        });
+      }
+    });
   };
 
   const formatTime = (seconds: number) => {
