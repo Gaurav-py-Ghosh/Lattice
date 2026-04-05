@@ -282,7 +282,17 @@ export function useVisionSession() {
    * Start a full-video session. videoPath must be the server-local path returned
    * by POST /upload_video. Used for post-interview analysis of the full recording.
    */
-  const startSession = useCallback((videoPath: string) => {
+  const startSession = useCallback((videoPathOrLegacyFlag: string | boolean) => {
+    const videoPath =
+      typeof videoPathOrLegacyFlag === 'string' ? videoPathOrLegacyFlag : '';
+
+    if (!videoPath) {
+      // Legacy callers were passing boolean headless; keep app stable and avoid bad payloads
+      console.warn('[useVisionSession] startSession now requires a video path string');
+      setError('Session start requires uploaded video path.');
+      return;
+    }
+
     _sendOrQueue({ action: 'start_session', video_path: videoPath });
   }, [_sendOrQueue]);
 
