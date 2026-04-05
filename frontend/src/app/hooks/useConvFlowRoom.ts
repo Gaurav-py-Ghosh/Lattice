@@ -24,6 +24,7 @@ export function useConvFlowRoom({ onTurnEnd, stream }: UseConvFlowRoomOptions) {
   useEffect(() => {
     // We only connect if the parent has provided a stream
     if (!stream) return;
+    const mediaStream = stream;
 
     const room = new Room();
 
@@ -50,9 +51,9 @@ export function useConvFlowRoom({ onTurnEnd, stream }: UseConvFlowRoomOptions) {
         await room.connect(LIVEKIT_URL, token);
         console.log("✅ Connected to Agent Room");
 
-        if (stream.getAudioTracks().length > 0) {
+        if (mediaStream.getAudioTracks().length > 0) {
           const { LocalAudioTrack } = await import("livekit-client");
-          const audioTrack = stream.getAudioTracks()[0];
+          const audioTrack = mediaStream.getAudioTracks()[0];
           await room.localParticipant.publishTrack(new LocalAudioTrack(audioTrack));
           console.log("🎤 Mic is LIVE");
         }
